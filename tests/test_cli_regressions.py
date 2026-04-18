@@ -5,10 +5,10 @@ import cat_db
 import main
 
 
-def test_default_config_path_uses_current_working_directory(monkeypatch, tmp_path):
-    monkeypatch.chdir(tmp_path)
+def test_default_config_path_uses_cache_directory(monkeypatch, tmp_path):
+    monkeypatch.setenv("HOME", str(tmp_path))
 
-    assert main.default_config_path() == tmp_path / "config.yaml"
+    assert main.default_config_path() == tmp_path / ".cache" / "llmup" / "config.yaml"
 
 
 def test_ensure_config_exists_creates_expected_default_file(tmp_path):
@@ -17,6 +17,14 @@ def test_ensure_config_exists_creates_expected_default_file(tmp_path):
     main.ensure_config_exists(config_path)
 
     assert config_path.read_text() == main.DEFAULT_CONFIG
+
+
+def test_ensure_config_exists_creates_parent_directories(tmp_path):
+    config_path = tmp_path / ".cache" / "llmup" / "config.yaml"
+
+    main.ensure_config_exists(config_path)
+
+    assert config_path.exists()
 
 
 def test_ensure_config_exists_does_not_overwrite_existing_config(tmp_path):
@@ -62,8 +70,8 @@ def test_main_set_config_uses_explicit_config_path(monkeypatch, tmp_path):
     assert seen == [config_path]
 
 
-def test_main_defaults_to_current_directory_config(monkeypatch, tmp_path):
-    monkeypatch.chdir(tmp_path)
+def test_main_defaults_to_cache_config(monkeypatch, tmp_path):
+    monkeypatch.setenv("HOME", str(tmp_path))
     seen = []
 
     def fake_start_everything(path, verbose=False):
@@ -75,7 +83,7 @@ def test_main_defaults_to_current_directory_config(monkeypatch, tmp_path):
     result = main.main([])
 
     assert result == 0
-    assert seen == [(tmp_path / "config.yaml", True)]
+    assert seen == [(tmp_path / ".cache" / "llmup" / "config.yaml", True)]
 
 
 def test_main_passes_silent_flag_to_start_everything(monkeypatch, tmp_path):
@@ -114,7 +122,7 @@ def test_start_everything_launches_tmux_before_load_balancer(monkeypatch, tmp_pa
     assert call_order[0][0] == "tmux"
     assert call_order[1] == ("serve", config_path, False)
     assert call_order[0][1] == "keepssh"
-    assert len(call_order[0][2]) == 8
+    assert len(call_order[0][2]) == 2
     assert call_order[0][2][0][:4] == [
         "ssh",
         "-o",

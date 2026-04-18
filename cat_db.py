@@ -20,16 +20,19 @@ REQUEST_LOGS_DIRNAME = "requests"
 
 
 def default_log_dir() -> pathlib.Path:
-    config_path = pathlib.Path("config.yaml")
-    if config_path.exists():
-        try:
-            for line in config_path.read_text().splitlines():
-                if line.startswith("log-dir:"):
-                    log_dir = line.split("log-dir:", 1)[1].strip()
-                    if log_dir:
-                        return pathlib.Path(log_dir).expanduser()
-        except Exception:
-            pass
+    for config_path in (
+        pathlib.Path(os.environ.get("LLM_LOADBALANCER_CONFIG", "~/.cache/llmup/config.yaml")).expanduser(),
+        pathlib.Path("config.yaml"),
+    ):
+        if config_path.exists():
+            try:
+                for line in config_path.read_text().splitlines():
+                    if line.startswith("log-dir:"):
+                        log_dir = line.split("log-dir:", 1)[1].strip()
+                        if log_dir:
+                            return pathlib.Path(log_dir).expanduser()
+            except Exception:
+                pass
     return pathlib.Path("~/.cache/llmup/logs").expanduser()
 
 

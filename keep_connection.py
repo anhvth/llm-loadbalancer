@@ -285,7 +285,7 @@ def main(argv: list[str]) -> int:
         "-c",
         "--config",
         type=pathlib.Path,
-        default=pathlib.Path("config.yaml"),
+        default=pathlib.Path("~/.cache/llmup/config.yaml").expanduser(),
         help="Path to the tunnel config",
     )
     parser.add_argument(

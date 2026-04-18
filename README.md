@@ -9,8 +9,9 @@ OpenAI-like HTTP traffic to a random local upstream.
 uvx --from git+https://github.com/anhvth/llm-loadbalancer llmproxy --set-config
 ```
 
-Run that once on a new machine to create and open `config.yaml`. After saving
-it, run the same command without `--set-config` to start the service.
+Run that once on a new machine to create and open `~/.cache/llmup/config.yaml`.
+After saving it, run the same command without `--set-config` to start the
+service.
 
 ## Config
 
@@ -18,17 +19,14 @@ Example `config.yaml`:
 
 ```yaml
 endpoints:
-  - hosts: <worker-host-pattern>
-  - port-start: <upstream-port-start>
-
-tmux:
-  session-name: <tmux-session-name>
+  - hosts: worker-[1,2]
+  - port-start: 18000
 
 port:
-  - <listen-port>
+  - 8001
 
 load-balancer:
-  workers: <worker-count>
+  workers: 20
   worker-concurrency: 512
   max-connections: 20000
   max-keepalive-connections: 4096
@@ -43,7 +41,7 @@ state in `~/.cache/llmup/affinity.sqlite3`.
 
 ### Commands
 
-- `uvx --from git+https://github.com/anhvth/llm-loadbalancer llmproxy --set-config` — create and open `config.yaml` on a new machine
+- `uvx --from git+https://github.com/anhvth/llm-loadbalancer llmproxy --set-config` — create and open `~/.cache/llmup/config.yaml`
 - `uvx --from git+https://github.com/anhvth/llm-loadbalancer llmproxy` — start the load balancer after config is set
 - `uvx --from git+https://github.com/anhvth/llm-loadbalancer cat_db` — inspect the request log directory in an interactive terminal
 - `uvx --from git+https://github.com/anhvth/llm-loadbalancer cat_db --raw` — print one JSON object per line for scripting

@@ -1,15 +1,12 @@
 endpoints:
-  - hosts: <worker-host-pattern>
-  - port-start: <upstream-port-start>
-
-tmux:
-  session-name: <tmux-session-name>
+  - hosts: worker-[1,2]
+  - port-start: 18000
 
 port:
-  - <listen-port>
+  - 8001
 
 load-balancer:
-  workers: <worker-count>
+  workers: 20
   worker-concurrency: 512
   max-connections: 20000
   max-keepalive-connections: 4096

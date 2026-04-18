@@ -9,14 +9,10 @@ import sys
 from keep_connection import iter_commands, launch_in_tmux, parse_config
 from load_balancer import serve_forever
 
-DEFAULT_CONFIG = """# 1. ssh to the target server and forward the port
-# ssh -L 8000:localhost:8000 user@target_server_ip
+DEFAULT_CONFIG = """# Replace the worker host pattern and upstream port start for your cluster.
 endpoints:
-  - hosts: worker-[41,45,49,53-54,57,59,61] # copy from login node
+  - hosts: worker-[1,2]
   - port-start: 18000
-
-tmux:
-  session-name: keepssh
 
 port:
   - 8001
@@ -33,12 +29,13 @@ load-balancer:
 
 
 def default_config_path() -> pathlib.Path:
-    return pathlib.Path.cwd() / "config.yaml"
+    return pathlib.Path("~/.cache/llmup/config.yaml").expanduser()
 
 
 def ensure_config_exists(config_path: pathlib.Path) -> None:
     if config_path.exists():
         return
+    config_path.parent.mkdir(parents=True, exist_ok=True)
     config_path.write_text(DEFAULT_CONFIG)
 
 
@@ -80,7 +77,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--config",
         type=pathlib.Path,
         default=default_config_path(),
-        help="Path to config.yaml. Defaults to ./config.yaml in the current directory",
+        help="Path to config.yaml. Defaults to ~/.cache/llmup/config.yaml",
     )
     parser.add_argument(
         "--set-config",

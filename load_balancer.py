@@ -573,7 +573,9 @@ class LoadBalancerApp:
 def resolve_config_path(config_path: pathlib.Path | None = None) -> pathlib.Path:
     if config_path is not None:
         return config_path
-    return pathlib.Path(os.environ.get("LLM_LOADBALANCER_CONFIG", "config.yaml"))
+    return pathlib.Path(
+        os.environ.get("LLM_LOADBALANCER_CONFIG", "~/.cache/llmup/config.yaml")
+    ).expanduser()
 
 
 def create_app(config_path: pathlib.Path | None = None, verbose: bool | None = None) -> LoadBalancerApp:
@@ -583,7 +585,10 @@ def create_app(config_path: pathlib.Path | None = None, verbose: bool | None = N
     return LoadBalancerApp(cfg, verbose=verbose)
 
 
-def serve_forever(config_path: pathlib.Path = pathlib.Path("config.yaml"), verbose: bool = True) -> None:
+def serve_forever(
+    config_path: pathlib.Path = pathlib.Path("~/.cache/llmup/config.yaml").expanduser(),
+    verbose: bool = True,
+) -> None:
     cfg = parse_config(config_path)
     os.environ["LLM_LOADBALANCER_CONFIG"] = str(config_path)
     os.environ["LLM_LOADBALANCER_VERBOSE"] = "1" if verbose else "0"
@@ -607,7 +612,7 @@ def main(argv: list[str] | None = None) -> int:
         "-c",
         "--config",
         type=pathlib.Path,
-        default=pathlib.Path("config.yaml"),
+        default=pathlib.Path("~/.cache/llmup/config.yaml").expanduser(),
         help="Path to the shared config file",
     )
     parser.add_argument(
