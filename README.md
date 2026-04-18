@@ -45,11 +45,16 @@ non-JSON traffic are proxied normally but skipped in the database.
 
 ## Inspect Logged Rows
 
-Use `cat_db` to print the SQLite rows as JSONL:
+Use `cat_db` to inspect the SQLite rows with a readable pretty view by default:
 
 ```bash
 uv run cat_db
 uv run cat_db /path/to/custom.sqlite3
+uv run cat_db --raw
 ```
 
 Without an argument, `cat_db` reads `./llm_loadbalancer.sqlite3`.
+
+- Default mode formats one row at a time and, in an interactive terminal, lets
+  you move with `Enter`, arrow keys, `j`/`k`, and quit with `q`.
+- Use `--raw` to print one JSON object per line for scripts or piping.
