@@ -631,14 +631,8 @@ def test_logs_bodyless_json_response_to_sqlite(tmp_path: Path):
         conn.close()
 
     assert response.status == 200
-    assert read_log_rows(db_path) == [
-        (
-            1,
-            "",
-            response_payload,
-            f"http://127.0.0.1:{upstream_ports[0]}/models",
-        )
-    ]
+    assert response_payload
+    assert read_log_rows(db_path) == []
 
 
 def test_logs_assign_incrementing_ids(tmp_path: Path):
@@ -654,7 +648,7 @@ def test_logs_assign_incrementing_ids(tmp_path: Path):
             conn.request(
                 "POST",
                 "/v1/chat/completions",
-                body=json.dumps({"request": index}),
+                body=json.dumps({"model": "demo", "messages": [{"role": "user", "content": str(index)}]}),
                 headers={"Content-Type": "application/json"},
             )
             response = conn.getresponse()
@@ -737,9 +731,7 @@ def test_proxies_streaming_response(tmp_path: Path):
 
     assert response.status == 200
     assert body == b"data: one\n\ndata: two\n\ndata: done\n\n"
-    rows = read_log_rows(db_path)
-    assert rows[0][:3] == (1, "", "data: one\n\ndata: two\n\ndata: done\n\n")
-    assert rows[0][3] in {f"http://127.0.0.1:{port}/stream" for port in upstream_ports}
+    assert read_log_rows(db_path) == []
 
 
 def test_logs_streaming_messages_as_final_json_shape(tmp_path: Path):

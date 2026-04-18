@@ -1075,6 +1075,12 @@ class LoadBalancerApp:
         normalized = self._normalize_sse_payload(response_text)
         return normalized if normalized is not None else response_text
 
+    def _should_log_request(self, request_json: Any) -> bool:
+        if not isinstance(request_json, dict):
+            return False
+        messages = request_json.get("messages")
+        return isinstance(messages, list) and bool(messages)
+
     def _log_exchange(
         self,
         request_body: bytes,
@@ -1085,15 +1091,21 @@ class LoadBalancerApp:
     ) -> None:
         try:
             request_text = self._decode_body_text(request_body)
-            response_text = self._decode_body_text(response_body)
         except UnicodeDecodeError:
             return
-        response_text = self._normalize_logged_response(response_text, content_type)
 
         try:
             request_json = json.loads(request_text) if request_text else {}
         except json.JSONDecodeError:
             request_json = request_text
+        if not self._should_log_request(request_json):
+            return
+
+        try:
+            response_text = self._decode_body_text(response_body)
+        except UnicodeDecodeError:
+            return
+        response_text = self._normalize_logged_response(response_text, content_type)
 
         try:
             response_json = json.loads(response_text) if response_text else {}
