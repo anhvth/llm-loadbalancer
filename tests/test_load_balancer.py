@@ -1,6 +1,7 @@
 import asyncio
 import http.client
 import json
+import os
 import socket
 import sqlite3
 import subprocess
@@ -885,6 +886,100 @@ def test_sqlite_affinity_store_retries_transient_init_lock(tmp_path: Path, monke
     store.close()
 
 
+class FakeResourceModule:
+    RLIMIT_NOFILE = 7
+    RLIM_INFINITY = -1
+
+    def __init__(self, soft_limit: int, hard_limit: int, setrlimit_error: Exception | None = None):
+        self.soft_limit = soft_limit
+        self.hard_limit = hard_limit
+        self.setrlimit_error = setrlimit_error
+        self.setrlimit_calls: list[tuple[int, tuple[int, int]]] = []
+
+    def getrlimit(self, kind):
+        assert kind == self.RLIMIT_NOFILE
+        return self.soft_limit, self.hard_limit
+
+    def setrlimit(self, kind, limits):
+        assert kind == self.RLIMIT_NOFILE
+        if self.setrlimit_error is not None:
+            raise self.setrlimit_error
+        self.setrlimit_calls.append((kind, limits))
+        self.soft_limit, self.hard_limit = limits
+
+
+def test_fd_plan_raises_soft_limit_when_hard_limit_allows(tmp_path: Path, monkeypatch):
+    config_path = tmp_path / "config.yaml"
+    upstream_ports = find_free_port_block(2)
+    write_config(config_path, upstream_ports, 8001)
+    config_path.write_text(config_path.read_text() + "  worker-concurrency: 10\n")
+    cfg = parse_config(config_path)
+    fake_resource = FakeResourceModule(soft_limit=64, hard_limit=1024)
+    monkeypatch.setattr(load_balancer, "resource_module", fake_resource)
+
+    plan = load_balancer.plan_file_descriptor_limits(cfg)
+
+    assert plan.effective_worker_concurrency == 10
+    assert plan.raised_soft_limit is True
+    assert fake_resource.setrlimit_calls == [
+        (fake_resource.RLIMIT_NOFILE, (plan.required_soft_limit, 1024))
+    ]
+
+
+def test_fd_plan_caps_concurrency_when_hard_limit_is_too_low(tmp_path: Path, monkeypatch):
+    config_path = tmp_path / "config.yaml"
+    upstream_ports = find_free_port_block(2)
+    write_config(config_path, upstream_ports, 8001)
+    config_path.write_text(config_path.read_text() + "  worker-concurrency: 100\n")
+    cfg = parse_config(config_path)
+    fake_resource = FakeResourceModule(soft_limit=64, hard_limit=200)
+    monkeypatch.setattr(load_balancer, "resource_module", fake_resource)
+
+    plan = load_balancer.plan_file_descriptor_limits(cfg)
+
+    assert plan.effective_worker_concurrency == 35
+    assert plan.capped_by_limit is True
+    assert plan.warning is not None
+    assert "hard limit is too low" in plan.warning
+    assert fake_resource.setrlimit_calls == []
+
+
+def test_fd_plan_uses_conservative_concurrency_without_resource(tmp_path: Path, monkeypatch):
+    config_path = tmp_path / "config.yaml"
+    upstream_ports = find_free_port_block(2)
+    write_config(config_path, upstream_ports, 8001)
+    cfg = parse_config(config_path)
+    monkeypatch.setattr(load_balancer, "resource_module", None)
+
+    plan = load_balancer.plan_file_descriptor_limits(cfg)
+
+    assert plan.effective_worker_concurrency == 447
+    assert plan.capped_by_limit is True
+    assert plan.warning is not None
+    assert "Could not inspect RLIMIT_NOFILE" in plan.warning
+
+
+def test_fd_plan_caps_concurrency_when_setrlimit_fails(tmp_path: Path, monkeypatch):
+    config_path = tmp_path / "config.yaml"
+    upstream_ports = find_free_port_block(2)
+    write_config(config_path, upstream_ports, 8001)
+    config_path.write_text(config_path.read_text() + "  worker-concurrency: 100\n")
+    cfg = parse_config(config_path)
+    fake_resource = FakeResourceModule(
+        soft_limit=160,
+        hard_limit=1024,
+        setrlimit_error=OSError("permission denied"),
+    )
+    monkeypatch.setattr(load_balancer, "resource_module", fake_resource)
+
+    plan = load_balancer.plan_file_descriptor_limits(cfg)
+
+    assert plan.effective_worker_concurrency == 15
+    assert plan.capped_by_limit is True
+    assert plan.warning is not None
+    assert "Could not raise RLIMIT_NOFILE" in plan.warning
+
+
 def test_parse_config_resolves_default_db_path_relative_to_config(tmp_path: Path):
     config_path = tmp_path / "config.yaml"
     upstream_ports = find_free_port_block(1)
@@ -907,15 +1002,28 @@ def test_serve_forever_does_not_enable_reload(monkeypatch, tmp_path: Path):
         seen["kwargs"] = kwargs
 
     monkeypatch.setattr(load_balancer.uvicorn, "run", fake_run)
+    monkeypatch.setattr(
+        load_balancer,
+        "plan_file_descriptor_limits",
+        lambda cfg: load_balancer.FileDescriptorPlan(
+            configured_worker_concurrency=512,
+            effective_worker_concurrency=123,
+            required_soft_limit=1153,
+            soft_limit=4096,
+            hard_limit=4096,
+        ),
+    )
 
     load_balancer.serve_forever(config_path, verbose=True)
 
     assert seen["kwargs"]["workers"] == 1
     assert seen["kwargs"]["port"] == 8123
+    assert seen["kwargs"]["limit_concurrency"] == 123
     assert "reload" not in seen["kwargs"]
+    assert os.environ[load_balancer.LLM_PROXY_EFFECTIVE_WORKER_CONCURRENCY_ENV] == "123"
 
 
-def test_build_client_derives_keepalive_limit_from_workers_and_concurrency(tmp_path: Path, monkeypatch):
+def test_build_client_uses_effective_worker_concurrency(tmp_path: Path, monkeypatch):
     config_path = tmp_path / "config.yaml"
     upstream_ports = find_free_port_block(1)
     write_config(config_path, upstream_ports, 8001)
@@ -924,6 +1032,7 @@ def test_build_client_derives_keepalive_limit_from_workers_and_concurrency(tmp_p
         + "  workers: 3\n"
         + "  worker-concurrency: 5\n"
     )
+    monkeypatch.delenv(load_balancer.LLM_PROXY_EFFECTIVE_WORKER_CONCURRENCY_ENV, raising=False)
 
     seen = {}
 
@@ -945,5 +1054,5 @@ def test_build_client_derives_keepalive_limit_from_workers_and_concurrency(tmp_p
     client = app._build_client()
 
     assert isinstance(client, DummyAsyncClient)
-    assert seen["limits"].max_connections == 15
-    assert seen["limits"].max_keepalive_connections == 15
+    assert seen["limits"].max_connections == 5
+    assert seen["limits"].max_keepalive_connections == 5

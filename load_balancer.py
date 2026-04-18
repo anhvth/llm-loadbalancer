@@ -27,6 +27,11 @@ import uvicorn
 
 from keep_connection import TunnelConfig, parse_config
 
+try:
+    import resource as resource_module
+except ImportError:  # pragma: no cover - resource is Unix-only.
+    resource_module = None
+
 HOP_BY_HOP_HEADERS = {
     b"connection",
     b"keep-alive",
@@ -50,6 +55,11 @@ HEALTHCHECK_CONNECT_RETRIES = 3
 HEALTHCHECK_CONNECT_RETRY_DELAY_SECONDS = 0.2
 HEALTHCHECK_STATE_FILENAME = "health_state.json"
 REQUEST_RESPONSE_LOG_MIN_INTERVAL_SECONDS = 2.0
+FD_BASE_OVERHEAD = 128
+FD_PER_CONCURRENT_REQUEST = 2
+FD_PER_ENDPOINT_HEALTHCHECK = 1
+FD_FALLBACK_SOFT_LIMIT = 1024
+LLM_PROXY_EFFECTIVE_WORKER_CONCURRENCY_ENV = "LLM_PROXY_EFFECTIVE_WORKER_CONCURRENCY"
 
 logger.remove()
 
@@ -67,6 +77,122 @@ class EndpointCheckResult:
     port: int
     models: tuple[str, ...] = ()
     error: str | None = None
+
+
+@dataclasses.dataclass(frozen=True)
+class FileDescriptorPlan:
+    configured_worker_concurrency: int
+    effective_worker_concurrency: int
+    required_soft_limit: int
+    soft_limit: int | None
+    hard_limit: int | None
+    raised_soft_limit: bool = False
+    capped_by_limit: bool = False
+    warning: str | None = None
+
+
+def fd_limit_required_for_worker_concurrency(cfg: TunnelConfig, worker_concurrency: int) -> int:
+    return (
+        FD_BASE_OVERHEAD
+        + len(cfg.hosts) * FD_PER_ENDPOINT_HEALTHCHECK
+        + worker_concurrency * FD_PER_CONCURRENT_REQUEST
+    )
+
+
+def worker_concurrency_for_fd_limit(cfg: TunnelConfig, fd_limit: int) -> int:
+    reserved = FD_BASE_OVERHEAD + len(cfg.hosts) * FD_PER_ENDPOINT_HEALTHCHECK
+    usable = max(0, fd_limit - reserved)
+    return max(1, usable // FD_PER_CONCURRENT_REQUEST)
+
+
+def _fd_limit_allows(limit: int, required: int) -> bool:
+    assert resource_module is not None
+    return limit == resource_module.RLIM_INFINITY or limit >= required
+
+
+def plan_file_descriptor_limits(cfg: TunnelConfig) -> FileDescriptorPlan:
+    configured_concurrency = max(1, cfg.load_balancer_worker_concurrency)
+    required_soft_limit = fd_limit_required_for_worker_concurrency(cfg, configured_concurrency)
+    if resource_module is None:
+        effective_concurrency = min(
+            configured_concurrency,
+            worker_concurrency_for_fd_limit(cfg, FD_FALLBACK_SOFT_LIMIT),
+        )
+        return FileDescriptorPlan(
+            configured_worker_concurrency=configured_concurrency,
+            effective_worker_concurrency=effective_concurrency,
+            required_soft_limit=required_soft_limit,
+            soft_limit=None,
+            hard_limit=None,
+            capped_by_limit=effective_concurrency < configured_concurrency,
+            warning="Could not inspect RLIMIT_NOFILE; using conservative worker concurrency",
+        )
+
+    soft_limit, hard_limit = resource_module.getrlimit(resource_module.RLIMIT_NOFILE)
+    if _fd_limit_allows(soft_limit, required_soft_limit):
+        return FileDescriptorPlan(
+            configured_worker_concurrency=configured_concurrency,
+            effective_worker_concurrency=configured_concurrency,
+            required_soft_limit=required_soft_limit,
+            soft_limit=soft_limit,
+            hard_limit=hard_limit,
+        )
+
+    if _fd_limit_allows(hard_limit, required_soft_limit):
+        try:
+            resource_module.setrlimit(
+                resource_module.RLIMIT_NOFILE,
+                (required_soft_limit, hard_limit),
+            )
+        except (OSError, ValueError) as exc:
+            effective_concurrency = min(
+                configured_concurrency,
+                worker_concurrency_for_fd_limit(cfg, soft_limit),
+            )
+            return FileDescriptorPlan(
+                configured_worker_concurrency=configured_concurrency,
+                effective_worker_concurrency=effective_concurrency,
+                required_soft_limit=required_soft_limit,
+                soft_limit=soft_limit,
+                hard_limit=hard_limit,
+                capped_by_limit=effective_concurrency < configured_concurrency,
+                warning=f"Could not raise RLIMIT_NOFILE: {exc}",
+            )
+        return FileDescriptorPlan(
+            configured_worker_concurrency=configured_concurrency,
+            effective_worker_concurrency=configured_concurrency,
+            required_soft_limit=required_soft_limit,
+            soft_limit=required_soft_limit,
+            hard_limit=hard_limit,
+            raised_soft_limit=True,
+        )
+
+    effective_concurrency = min(
+        configured_concurrency,
+        worker_concurrency_for_fd_limit(cfg, hard_limit),
+    )
+    return FileDescriptorPlan(
+        configured_worker_concurrency=configured_concurrency,
+        effective_worker_concurrency=effective_concurrency,
+        required_soft_limit=required_soft_limit,
+        soft_limit=soft_limit,
+        hard_limit=hard_limit,
+        capped_by_limit=effective_concurrency < configured_concurrency,
+        warning=(
+            "RLIMIT_NOFILE hard limit is too low for configured worker concurrency; "
+            f"using worker-concurrency={effective_concurrency}"
+        ),
+    )
+
+
+def resolve_effective_worker_concurrency(cfg: TunnelConfig) -> int:
+    raw_value = os.environ.get(LLM_PROXY_EFFECTIVE_WORKER_CONCURRENCY_ENV)
+    if raw_value is None:
+        return max(1, cfg.load_balancer_worker_concurrency)
+    try:
+        return max(1, int(raw_value))
+    except ValueError:
+        return max(1, cfg.load_balancer_worker_concurrency)
 
 
 class AsyncFileLogWriter:
@@ -233,6 +359,7 @@ class LoadBalancerApp:
     def __init__(self, cfg: TunnelConfig, verbose: bool = True):
         self.cfg = cfg
         self.verbose = verbose
+        self.effective_worker_concurrency = resolve_effective_worker_concurrency(cfg)
         self.upstream_endpoints = build_upstream_endpoints(cfg)
         self.upstream_endpoint_labels = build_upstream_endpoint_labels(cfg)
         self.endpoint_request_counts: dict[str, int] = {
@@ -559,10 +686,9 @@ class LoadBalancerApp:
                 return
 
     def _build_client(self) -> httpx.AsyncClient:
-        max_connections = self.cfg.load_balancer_workers * self.cfg.load_balancer_worker_concurrency
         limits = httpx.Limits(
-            max_connections=max_connections,
-            max_keepalive_connections=max_connections,
+            max_connections=self.effective_worker_concurrency,
+            max_keepalive_connections=self.effective_worker_concurrency,
         )
         timeout = httpx.Timeout(
             connect=UPSTREAM_TIMEOUT_SECONDS,
@@ -954,15 +1080,34 @@ def serve_forever(
     verbose: bool = True,
 ) -> None:
     cfg = parse_config(config_path)
+    fd_plan = plan_file_descriptor_limits(cfg)
     os.environ["LLM_PROXY_CONFIG"] = str(config_path)
     os.environ["LLM_PROXY_VERBOSE"] = "1" if verbose else "0"
+    os.environ[LLM_PROXY_EFFECTIVE_WORKER_CONCURRENCY_ENV] = str(
+        fd_plan.effective_worker_concurrency
+    )
+    if fd_plan.raised_soft_limit:
+        logger.info(
+            "Raised RLIMIT_NOFILE soft limit to {} for worker-concurrency={}",
+            fd_plan.required_soft_limit,
+            fd_plan.configured_worker_concurrency,
+        )
+    if fd_plan.warning:
+        logger.warning(
+            "{} (configured worker-concurrency={}, soft-limit={}, hard-limit={}, required={})",
+            fd_plan.warning,
+            fd_plan.configured_worker_concurrency,
+            fd_plan.soft_limit if fd_plan.soft_limit is not None else "unknown",
+            fd_plan.hard_limit if fd_plan.hard_limit is not None else "unknown",
+            fd_plan.required_soft_limit,
+        )
     uvicorn.run(
         "load_balancer:create_app",
         factory=True,
         host="127.0.0.1",
         port=cfg.listen_port,
         workers=cfg.load_balancer_workers,
-        limit_concurrency=cfg.load_balancer_worker_concurrency,
+        limit_concurrency=fd_plan.effective_worker_concurrency,
         backlog=4096,
         timeout_keep_alive=30,
         access_log=False,

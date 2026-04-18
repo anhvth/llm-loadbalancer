@@ -40,8 +40,8 @@ request log files to `~/.cache/llm-proxy/logs` and stores shared message-affinit
 state in `~/.cache/llm-proxy/affinity.sqlite3`. Local SSH tunnel ports default
 to the fixed range starting at `18000`, so you only need `port-start` if you
 want a different range.
-`max-connections` and `max-keepalive-connections` are derived automatically as
-`workers * worker-concurrency`.
+Per-worker upstream connection limits are derived automatically from
+`worker-concurrency` and the process file descriptor limit.
 
 ### Commands
 
