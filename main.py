@@ -9,10 +9,10 @@ import sys
 from keep_connection import iter_commands, launch_in_tmux, parse_config
 from load_balancer import serve_forever
 
-DEFAULT_CONFIG = """# Replace the worker host pattern and upstream port start for your cluster.
+DEFAULT_CONFIG = """# Replace the worker host entries with your actual SSH targets.
 endpoints:
-  - hosts: worker-[1,2]
-  - port-start: 18000
+  - worker-45:8000
+  - worker-41:8000
 
 port:
   - 8001

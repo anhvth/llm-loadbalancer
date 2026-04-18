@@ -19,8 +19,8 @@ Example `config.yaml`:
 
 ```yaml
 endpoints:
-  - hosts: worker-[1,2]
-  - port-start: 18000
+  - worker-45:8000
+  - worker-41:8000
 
 port:
   - 8001
@@ -37,7 +37,8 @@ load-balancer:
 
 `log-dir` and `affinity-db` are optional. If omitted, the load balancer writes
 request log files to `~/.cache/llmup/logs` and stores shared message-affinity
-state in `~/.cache/llmup/affinity.sqlite3`.
+state in `~/.cache/llmup/affinity.sqlite3`. Local SSH tunnel ports are chosen
+automatically from a free high port range, so you do not need `port-start`.
 
 ### Commands
 

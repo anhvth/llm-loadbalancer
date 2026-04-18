@@ -4,14 +4,15 @@
 The current config format is intentionally simple:
 
 endpoints:
-  - hosts: worker-[41,45,49,53-54,57,59,61]
-  - port-start: 18000
+  - worker-45:8000
+  - worker-41:8000
 
 Optional keys:
   - remote-port: 8000
   - user: myuser
   - ssh-options: -o ServerAliveInterval=30 -o ServerAliveCountMax=3
   - tmux.session-name: keepssh
+  - port-start: 50000
 
 The script can print the commands it would run, or launch them and restart
 failed tunnels.
@@ -22,10 +23,12 @@ from __future__ import annotations
 import argparse
 import dataclasses
 import pathlib
+import random
 import re
 import shlex
 import subprocess
 import sys
+import socket
 from typing import Iterable
 
 
@@ -33,6 +36,7 @@ from typing import Iterable
 class TunnelConfig:
     hosts: list[str]
     port_start: int
+    remote_ports: list[int] = dataclasses.field(default_factory=list)
     remote_port: int = 8000
     listen_port: int = 8001
     load_balancer_workers: int = 20
@@ -86,6 +90,48 @@ def resolve_config_relative_path(config_path: pathlib.Path, raw_path: str) -> pa
     return config_path.parent / candidate
 
 
+def _is_port_free(port: int) -> bool:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        try:
+            sock.bind(("127.0.0.1", port))
+        except OSError:
+            return False
+    return True
+
+
+def find_free_port_start(count: int, low: int = 50000, high: int = 65000) -> int:
+    if count <= 0:
+        raise ValueError("count must be positive")
+    max_start = high - count + 1
+    if max_start < low:
+        raise ValueError("Port range is too small for the requested number of tunnels")
+
+    candidates = list(range(low, max_start + 1))
+    random.shuffle(candidates)
+    for start in candidates:
+        if all(_is_port_free(start + offset) for offset in range(count)):
+            return start
+    raise RuntimeError("Could not find a free tunnel port range")
+
+
+def _expand_endpoint_hosts(raw_host: str) -> list[str]:
+    if raw_host.startswith("[") and raw_host.endswith("]"):
+        return [
+            item.strip().strip("'\"")
+            for item in raw_host[1:-1].split(",")
+            if item.strip()
+        ]
+    return expand_host_pattern(raw_host.strip().strip("'\""))
+
+
+def _parse_endpoint_entry(value: str, default_remote_port: int) -> list[tuple[str, int]]:
+    if ":" in value and not value.startswith("["):
+        host_part, port_part = value.rsplit(":", 1)
+        if port_part.isdigit() and host_part:
+            return [(host, int(port_part)) for host in _expand_endpoint_hosts(host_part)]
+    return [(host, default_remote_port) for host in _expand_endpoint_hosts(value)]
+
+
 def parse_config(path: pathlib.Path) -> TunnelConfig:
     lines = [strip_comment(line) for line in path.read_text().splitlines()]
     lines = [line for line in lines if line.strip()]
@@ -96,6 +142,7 @@ def parse_config(path: pathlib.Path) -> TunnelConfig:
     load_balancer: dict[str, str] = {}
     ports: list[str] = []
     endpoint_items: list[tuple[str, str]] = []
+    endpoint_entries: list[tuple[str, int]] = []
 
     for raw_line in lines:
         line = raw_line.rstrip()
@@ -105,7 +152,12 @@ def parse_config(path: pathlib.Path) -> TunnelConfig:
 
         match = re.fullmatch(r"\s*-\s*([A-Za-z0-9_.-]+):\s*(.+)", line)
         if match and section == "endpoints":
-            endpoint_items.append((match.group(1), match.group(2).strip()))
+            key = match.group(1)
+            value = match.group(2).strip()
+            if key in {"hosts", "port-start", "remote-port"}:
+                endpoint_items.append((key, value))
+            else:
+                endpoint_entries.extend(_parse_endpoint_entry(f"{key}:{value}", 8000))
             continue
 
         match = re.fullmatch(r"\s*-\s*(.+)", line)
@@ -115,7 +167,15 @@ def parse_config(path: pathlib.Path) -> TunnelConfig:
 
         match = re.fullmatch(r"\s*-\s*(.+)", line)
         if match and section == "endpoints":
-            endpoint_items.append(("hosts", match.group(1).strip()))
+            entry = match.group(1).strip()
+            if ":" in entry:
+                host_part, port_part = entry.rsplit(":", 1)
+                if port_part.isdigit() and host_part:
+                    endpoint_entries.extend(
+                        _parse_endpoint_entry(entry, 8000)
+                    )
+                    continue
+            endpoint_items.append(("hosts", entry))
             continue
 
         match = re.fullmatch(r"\s*([A-Za-z0-9_.-]+):\s*(.+)", line)
@@ -137,23 +197,23 @@ def parse_config(path: pathlib.Path) -> TunnelConfig:
             merged[key] = value
     merged.update(root)
 
+    remote_port = int(merged.get("remote-port", "8000"))
     hosts_raw = merged.get("hosts")
-    if not hosts_raw:
-        raise ValueError("Config is missing endpoints.hosts")
-    if hosts_raw.startswith("[") and hosts_raw.endswith("]"):
-        hosts = [
-            item.strip().strip("'\"")
-            for item in hosts_raw[1:-1].split(",")
-            if item.strip()
-        ]
+    if endpoint_entries:
+        hosts = [host for host, _ in endpoint_entries]
+        remote_ports = [port if port is not None else remote_port for _, port in endpoint_entries]
+    elif hosts_raw:
+        hosts = _expand_endpoint_hosts(hosts_raw)
+        remote_ports = [remote_port] * len(hosts)
     else:
-        hosts = expand_host_pattern(hosts_raw.strip().strip("'\""))
+        raise ValueError("Config is missing endpoints.hosts")
 
     port_start_raw = merged.get("port-start")
     if port_start_raw is None:
-        raise ValueError("Config is missing endpoints.port-start")
+        port_start = find_free_port_start(len(hosts))
+    else:
+        port_start = int(port_start_raw)
 
-    remote_port = int(merged.get("remote-port", "8000"))
     listen_port = int(ports[0]) if ports else int(merged.get("listen-port", "8001"))
     load_balancer_workers = int(load_balancer.get("workers", "20"))
     load_balancer_worker_concurrency = int(load_balancer.get("worker-concurrency", "512"))
@@ -176,7 +236,8 @@ def parse_config(path: pathlib.Path) -> TunnelConfig:
 
     return TunnelConfig(
         hosts=hosts,
-        port_start=int(port_start_raw),
+        port_start=port_start,
+        remote_ports=remote_ports,
         remote_port=remote_port,
         listen_port=listen_port,
         load_balancer_workers=load_balancer_workers,
@@ -207,8 +268,9 @@ def build_command(host: str, local_port: int, remote_port: int, cfg: TunnelConfi
 
 
 def iter_commands(cfg: TunnelConfig) -> Iterable[list[str]]:
-    for index, host in enumerate(cfg.hosts):
-        yield build_command(host, cfg.port_start + index, cfg.remote_port, cfg)
+    remote_ports = cfg.remote_ports or [cfg.remote_port] * len(cfg.hosts)
+    for index, (host, remote_port) in enumerate(zip(cfg.hosts, remote_ports)):
+        yield build_command(host, cfg.port_start + index, remote_port, cfg)
 
 
 def tmux_quoted_command(cmd: list[str]) -> str:

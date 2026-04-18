@@ -1,6 +1,6 @@
 endpoints:
-  - hosts: worker-[1,2]
-  - port-start: 18000
+  - worker-45:8000
+  - worker-41:8000
 
 port:
   - 8001

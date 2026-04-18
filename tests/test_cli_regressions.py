@@ -2,6 +2,7 @@ import pathlib
 import json
 
 import cat_db
+import keep_connection
 import main
 
 
@@ -113,6 +114,7 @@ def test_start_everything_launches_tmux_before_load_balancer(monkeypatch, tmp_pa
     def fake_serve_forever(path, verbose=False):
         call_order.append(("serve", path, verbose))
 
+    monkeypatch.setattr(keep_connection, "find_free_port_start", lambda count, low=50000, high=65000: 50000)
     monkeypatch.setattr(main, "launch_in_tmux", fake_launch_in_tmux)
     monkeypatch.setattr(main, "serve_forever", fake_serve_forever)
 
@@ -123,12 +125,8 @@ def test_start_everything_launches_tmux_before_load_balancer(monkeypatch, tmp_pa
     assert call_order[1] == ("serve", config_path, False)
     assert call_order[0][1] == "keepssh"
     assert len(call_order[0][2]) == 2
-    assert call_order[0][2][0][:4] == [
-        "ssh",
-        "-o",
-        "ExitOnForwardFailure=yes",
-        "-N",
-    ]
+    assert call_order[0][2][0][5] == "50000:localhost:8000"
+    assert call_order[0][2][1][5] == "50001:localhost:8000"
 
 
 def test_main_returns_130_on_keyboard_interrupt(monkeypatch, tmp_path):
