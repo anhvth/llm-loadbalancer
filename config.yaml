@@ -1,0 +1,21 @@
+# 1. ssh to the target server and forward the port
+# ssh -L 8000:localhost:8000 user@target_server_ip
+endpoints:
+  - hosts: worker-[41,45,49,53-54,57,59,61] # copy from login node
+  - port-start: 18000
+
+
+
+tmux:
+  session-name: keepssh
+
+port:
+  - 8001
+
+load-balancer:
+  workers: 20
+  worker-concurrency: 512
+  max-connections: 20000
+  max-keepalive-connections: 4096
+  upstream-timeout: 300
+  db-path: llm_loadbalancer.sqlite3
