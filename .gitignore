@@ -6,5 +6,8 @@ dist/
 wheels/
 *.egg-info
 
+# Chainlit
+.chainlit/
+
 # Virtual environments
 .venv
