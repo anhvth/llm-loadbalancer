@@ -22,6 +22,7 @@ import uuid
 
 import httpx
 from loguru import logger
+from tabulate import tabulate
 import uvicorn
 
 from keep_connection import TunnelConfig, parse_config
@@ -43,6 +44,8 @@ REQUEST_LOGS_DIRNAME = "requests"
 UPSTREAM_TIMEOUT_SECONDS = 300.0
 HEALTHCHECK_TIMEOUT_SECONDS = 2.0
 HEALTHCHECK_INTERVAL_SECONDS = 30.0
+HEALTHCHECK_CONNECT_RETRIES = 3
+HEALTHCHECK_CONNECT_RETRY_DELAY_SECONDS = 0.2
 HEALTHCHECK_STATE_FILENAME = "health_state.json"
 
 logger.remove()
@@ -279,6 +282,12 @@ class LoadBalancerApp:
             return "Connection refused"
         return error
 
+    def _is_retryable_health_error(self, error: httpx.HTTPError) -> bool:
+        if isinstance(error, httpx.ConnectError):
+            return True
+        text = str(error)
+        return "Connection refused" in text or "All connection attempts failed" in text
+
     def _stateful_health_snapshot(
         self, results: list[EndpointCheckResult]
     ) -> tuple[dict[str, Any] | None, dict[str, Any], bool]:
@@ -418,17 +427,22 @@ class LoadBalancerApp:
 
     def _check_endpoint_sync(self, client: httpx.Client, endpoint: tuple[str, int]) -> EndpointCheckResult:
         host, port = endpoint
-        try:
-            models, server_error = self._probe_models_sync(client, endpoint)
-            if server_error is not None:
-                return EndpointCheckResult(
-                    host=host,
-                    port=port,
-                    error=server_error,
-                )
-            return EndpointCheckResult(host=host, port=port, models=models)
-        except httpx.HTTPError as exc:
-            return EndpointCheckResult(host=host, port=port, error=str(exc))
+        retries = max(0, HEALTHCHECK_CONNECT_RETRIES)
+        for attempt in range(retries + 1):
+            try:
+                models, server_error = self._probe_models_sync(client, endpoint)
+                if server_error is not None:
+                    return EndpointCheckResult(
+                        host=host,
+                        port=port,
+                        error=server_error,
+                    )
+                return EndpointCheckResult(host=host, port=port, models=models)
+            except httpx.HTTPError as exc:
+                if attempt >= retries or not self._is_retryable_health_error(exc):
+                    return EndpointCheckResult(host=host, port=port, error=str(exc))
+                time.sleep(max(0.0, HEALTHCHECK_CONNECT_RETRY_DELAY_SECONDS))
+        return EndpointCheckResult(host=host, port=port, error="Healthcheck failed")
 
     async def _check_endpoint_async(
         self,
@@ -436,27 +450,46 @@ class LoadBalancerApp:
         endpoint: tuple[str, int],
     ) -> EndpointCheckResult:
         host, port = endpoint
-        try:
-            models, server_error = await self._probe_models_async(client, endpoint)
-            if server_error is not None:
-                return EndpointCheckResult(
-                    host=host,
-                    port=port,
-                    error=server_error,
-                )
-            return EndpointCheckResult(host=host, port=port, models=models)
-        except httpx.HTTPError as exc:
-            return EndpointCheckResult(host=host, port=port, error=str(exc))
+        retries = max(0, HEALTHCHECK_CONNECT_RETRIES)
+        for attempt in range(retries + 1):
+            try:
+                models, server_error = await self._probe_models_async(client, endpoint)
+                if server_error is not None:
+                    return EndpointCheckResult(
+                        host=host,
+                        port=port,
+                        error=server_error,
+                    )
+                return EndpointCheckResult(host=host, port=port, models=models)
+            except httpx.HTTPError as exc:
+                if attempt >= retries or not self._is_retryable_health_error(exc):
+                    return EndpointCheckResult(host=host, port=port, error=str(exc))
+                await asyncio.sleep(max(0.0, HEALTHCHECK_CONNECT_RETRY_DELAY_SECONDS))
+        return EndpointCheckResult(host=host, port=port, error="Healthcheck failed")
 
     def _summarize_health(self, results: list[EndpointCheckResult]) -> None:
         previous_snapshot, current_snapshot, changed = self._stateful_health_snapshot(results)
         if not changed:
             return
-        logger.info(
-            "health: {} connected, models: {}",
-            current_snapshot["connected"],
-            ", ".join(current_snapshot["models"]) if current_snapshot["models"] else "none",
+        endpoints = current_snapshot["endpoints"]
+        if not endpoints:
+            logger.info("health: none")
+            return
+        rows = [
+            [
+                endpoint,
+                state["status"].upper(),
+                ",".join(state.get("models", ())) if state.get("models") else "-",
+                state.get("error", "-"),
+            ]
+            for endpoint, state in endpoints.items()
+        ]
+        table = tabulate(
+            rows,
+            headers=["endpoint", "status", "models", "error"],
+            tablefmt="simple",
         )
+        logger.info("health:\n{}", table)
         self._log_health_changes(previous_snapshot, current_snapshot)
 
     def _initial_healthcheck(self) -> list[EndpointCheckResult]:

@@ -9,6 +9,7 @@ from contextlib import contextmanager
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
+import httpx
 import pytest
 import uvicorn
 
@@ -330,9 +331,13 @@ def test_refresh_health_keeps_working_endpoints_and_warns_on_dead_ones(
         asyncio.run(app.refresh_health())
         captured = capsys.readouterr()
 
-        assert f"backend-{upstream_ports[0]}" in captured.err
-        assert f"backend-{upstream_ports[1]}" in captured.err
-        assert "health: 1 connected" in captured.err
+        assert "health:" in captured.err
+        assert "endpoint" in captured.err
+        assert "status" in captured.err
+        assert f"worker-1:8000 (local {upstream_ports[0]})" in captured.err
+        assert f"worker-2:8000 (local {upstream_ports[1]})" in captured.err
+        assert "UP" in captured.err
+        assert "DOWN" in captured.err
         assert "unreachable" in captured.err
         assert f"worker-2:8000 (local {upstream_ports[1]}) unreachable" in captured.err
         assert [endpoint.port for endpoint in app.valid_endpoints] == [upstream_ports[0]]
@@ -370,6 +375,54 @@ def test_refresh_health_logs_only_on_information_gain(monkeypatch, tmp_path: Pat
         server_one.shutdown()
         server_one.server_close()
         thread_one.join(timeout=5)
+
+
+def test_check_endpoint_sync_retries_transient_connection_errors(monkeypatch):
+    app = load_balancer.LoadBalancerApp.__new__(load_balancer.LoadBalancerApp)
+    endpoint = ("worker-1", 18000)
+    request = httpx.Request("GET", "http://127.0.0.1:18000/models")
+    calls = 0
+
+    def fake_probe(_client, _endpoint):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise httpx.ConnectError("All connection attempts failed", request=request)
+        return ("model-a",), None
+
+    monkeypatch.setattr(app, "_probe_models_sync", fake_probe)
+    monkeypatch.setattr(load_balancer, "HEALTHCHECK_CONNECT_RETRIES", 1)
+    monkeypatch.setattr(load_balancer, "HEALTHCHECK_CONNECT_RETRY_DELAY_SECONDS", 0.0)
+
+    result = app._check_endpoint_sync(object(), endpoint)
+
+    assert result.error is None
+    assert result.models == ("model-a",)
+    assert calls == 2
+
+
+def test_check_endpoint_async_retries_transient_connection_errors(monkeypatch):
+    app = load_balancer.LoadBalancerApp.__new__(load_balancer.LoadBalancerApp)
+    endpoint = ("worker-1", 18000)
+    request = httpx.Request("GET", "http://127.0.0.1:18000/models")
+    calls = 0
+
+    async def fake_probe(_client, _endpoint):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise httpx.ConnectError("All connection attempts failed", request=request)
+        return ("model-a",), None
+
+    monkeypatch.setattr(app, "_probe_models_async", fake_probe)
+    monkeypatch.setattr(load_balancer, "HEALTHCHECK_CONNECT_RETRIES", 1)
+    monkeypatch.setattr(load_balancer, "HEALTHCHECK_CONNECT_RETRY_DELAY_SECONDS", 0.0)
+
+    result = asyncio.run(app._check_endpoint_async(object(), endpoint))
+
+    assert result.error is None
+    assert result.models == ("model-a",)
+    assert calls == 2
 
 
 def test_proxies_large_post_payload(tmp_path: Path):
