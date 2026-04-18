@@ -12,6 +12,7 @@ from pathlib import Path
 import uvicorn
 
 from keep_connection import parse_config
+import load_balancer
 from load_balancer import create_app
 
 
@@ -59,6 +60,51 @@ class StubHandler(BaseHTTPRequestHandler):
     def do_POST(self):  # noqa: N802
         length = int(self.headers.get("Content-Length", "0"))
         body = self.rfile.read(length)
+        if self.path == "/v1/messages":
+            events = [
+                {
+                    "type": "message_start",
+                    "message": {
+                        "id": "msg_123",
+                        "type": "message",
+                        "role": "assistant",
+                        "model": "demo-model",
+                        "content": [],
+                        "stop_reason": None,
+                        "stop_sequence": None,
+                        "usage": {"input_tokens": 12, "output_tokens": 0},
+                    },
+                },
+                {
+                    "type": "content_block_start",
+                    "index": 0,
+                    "content_block": {"type": "text", "text": ""},
+                },
+                {
+                    "type": "content_block_delta",
+                    "index": 0,
+                    "delta": {"type": "text_delta", "text": "Hello"},
+                },
+                {
+                    "type": "content_block_delta",
+                    "index": 0,
+                    "delta": {"type": "text_delta", "text": " world"},
+                },
+                {
+                    "type": "message_delta",
+                    "delta": {"stop_reason": "end_turn", "stop_sequence": None},
+                    "usage": {"output_tokens": 2},
+                },
+                {"type": "message_stop"},
+            ]
+            payload = "".join(f"data: {json.dumps(event)}\n\n" for event in events).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+            return
+
         payload = json.dumps(
             {
                 "received_bytes": len(body),
@@ -247,6 +293,31 @@ def test_logs_json_request_response_to_sqlite(tmp_path: Path):
     ]
 
 
+def test_logs_bodyless_json_response_to_sqlite(tmp_path: Path):
+    config_path = tmp_path / "config.yaml"
+    db_path = tmp_path / "requests.sqlite3"
+    upstream_ports = find_free_port_block(1)
+    write_config(config_path, upstream_ports, 8001)
+    config_path.write_text(config_path.read_text() + f"  db-path: {db_path}\n")
+
+    with run_stub_server(upstream_ports[0]), run_load_balancer(config_path) as listen_port:
+        conn = http.client.HTTPConnection("127.0.0.1", listen_port, timeout=30)
+        conn.request("GET", "/models")
+        response = conn.getresponse()
+        response_payload = response.read().decode("utf-8")
+        conn.close()
+
+    assert response.status == 200
+    assert read_log_rows(db_path) == [
+        (
+            1,
+            "",
+            response_payload,
+            f"http://127.0.0.1:{upstream_ports[0]}/models",
+        )
+    ]
+
+
 def test_logs_assign_incrementing_ids(tmp_path: Path):
     config_path = tmp_path / "config.yaml"
     db_path = tmp_path / "requests.sqlite3"
@@ -329,7 +400,56 @@ def test_proxies_streaming_response(tmp_path: Path):
 
     assert response.status == 200
     assert body == b"data: one\n\ndata: two\n\ndata: done\n\n"
-    assert read_log_rows(db_path) == []
+    rows = read_log_rows(db_path)
+    assert rows[0][:3] == (1, "", "data: one\n\ndata: two\n\ndata: done\n\n")
+    assert rows[0][3] in {f"http://127.0.0.1:{port}/stream" for port in upstream_ports}
+
+
+def test_logs_streaming_messages_as_final_json_shape(tmp_path: Path):
+    config_path = tmp_path / "config.yaml"
+    db_path = tmp_path / "requests.sqlite3"
+    upstream_ports = find_free_port_block(1)
+    write_config(config_path, upstream_ports, 8001)
+    config_path.write_text(config_path.read_text() + f"  db-path: {db_path}\n")
+    request_payload = {
+        "model": "demo-model",
+        "messages": [{"role": "user", "content": "hi"}],
+        "stream": True,
+    }
+
+    with run_stub_server(upstream_ports[0]), run_load_balancer(config_path) as listen_port:
+        conn = http.client.HTTPConnection("127.0.0.1", listen_port, timeout=30)
+        conn.request(
+            "POST",
+            "/v1/messages",
+            body=json.dumps(request_payload),
+            headers={"Content-Type": "application/json"},
+        )
+        response = conn.getresponse()
+        body = response.read().decode("utf-8")
+        conn.close()
+
+    assert response.status == 200
+    assert "message_start" in body
+    assert read_log_rows(db_path) == [
+        (
+            1,
+            json.dumps(request_payload),
+            json.dumps(
+                {
+                    "id": "msg_123",
+                    "type": "message",
+                    "role": "assistant",
+                    "model": "demo-model",
+                    "content": [{"type": "text", "text": "Hello world"}],
+                    "stop_reason": "end_turn",
+                    "stop_sequence": None,
+                    "usage": {"input_tokens": 12, "output_tokens": 2},
+                }
+            ),
+            f"http://127.0.0.1:{upstream_ports[0]}/v1/messages",
+        )
+    ]
 
 
 def test_parse_config_resolves_default_db_path_relative_to_config(tmp_path: Path):
@@ -340,3 +460,22 @@ def test_parse_config_resolves_default_db_path_relative_to_config(tmp_path: Path
     cfg = parse_config(config_path)
 
     assert cfg.load_balancer_db_path == tmp_path / "llm_loadbalancer.sqlite3"
+
+
+def test_serve_forever_does_not_enable_reload(monkeypatch, tmp_path: Path):
+    config_path = tmp_path / "config.yaml"
+    upstream_ports = find_free_port_block(1)
+    write_config(config_path, upstream_ports, 8123)
+    seen = {}
+
+    def fake_run(*args, **kwargs):
+        seen["args"] = args
+        seen["kwargs"] = kwargs
+
+    monkeypatch.setattr(load_balancer.uvicorn, "run", fake_run)
+
+    load_balancer.serve_forever(config_path, verbose=True)
+
+    assert seen["kwargs"]["workers"] == 1
+    assert seen["kwargs"]["port"] == 8123
+    assert "reload" not in seen["kwargs"]
