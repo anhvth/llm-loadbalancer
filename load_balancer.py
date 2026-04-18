@@ -47,6 +47,7 @@ HEALTHCHECK_INTERVAL_SECONDS = 30.0
 HEALTHCHECK_CONNECT_RETRIES = 3
 HEALTHCHECK_CONNECT_RETRY_DELAY_SECONDS = 0.2
 HEALTHCHECK_STATE_FILENAME = "health_state.json"
+REQUEST_RESPONSE_LOG_MIN_INTERVAL_SECONDS = 2.0
 
 logger.remove()
 
@@ -73,6 +74,7 @@ class AsyncFileLogWriter:
         self.requests_dir = root_dir / REQUEST_LOGS_DIRNAME
         self._queue: queue.Queue[dict[str, Any] | None] = queue.Queue()
         self._thread: threading.Thread | None = None
+        self._last_verbose_log_at: float | None = None
 
     def start(self) -> None:
         self.root_dir.mkdir(parents=True, exist_ok=True)
@@ -111,6 +113,13 @@ class AsyncFileLogWriter:
         return final_path
 
     def _print_logged_payload(self, path: pathlib.Path, payload: dict[str, Any]) -> None:
+        now = time.monotonic()
+        if (
+            self._last_verbose_log_at is not None
+            and now - self._last_verbose_log_at < REQUEST_RESPONSE_LOG_MIN_INTERVAL_SECONDS
+        ):
+            return
+        self._last_verbose_log_at = now
         logger.info(
             "[request_response_log] log_path {} endpoint={} route={}",
             path,
@@ -211,6 +220,12 @@ class LoadBalancerApp:
         self.verbose = verbose
         self.upstream_endpoints = build_upstream_endpoints(cfg)
         self.upstream_endpoint_labels = build_upstream_endpoint_labels(cfg)
+        self.endpoint_request_counts: dict[str, int] = {
+            label: 0 for label in self.upstream_endpoint_labels.values()
+        }
+        self._endpoint_label_by_port: dict[int, str] = {
+            endpoint[1]: label for endpoint, label in self.upstream_endpoint_labels.items()
+        }
         self._health_state_path = self.cfg.load_balancer_log_dir / HEALTHCHECK_STATE_FILENAME
         self._last_health_digest: str | None = None
         self._last_health_snapshot: dict[str, Any] | None = None
@@ -299,14 +314,17 @@ class LoadBalancerApp:
         }
         for result in sorted(results, key=lambda item: (item.host, item.port)):
             label = self._endpoint_label(result)
+            requests_served = self.endpoint_request_counts.get(label, 0)
             if result.error is None:
                 snapshot["endpoints"][label] = {
                     "status": "up",
                     "models": sorted(set(result.models)),
+                    "requests": requests_served,
                 }
             else:
                 snapshot["endpoints"][label] = {
                     "status": "down",
+                    "requests": requests_served,
                     "error": self._normalize_health_error(result.error),
                 }
 
@@ -350,40 +368,6 @@ class LoadBalancerApp:
             self._last_health_digest = digest
             self._last_health_snapshot = snapshot
             return previous_snapshot, snapshot, True
-
-    def _log_health_changes(
-        self,
-        previous_snapshot: dict[str, Any] | None,
-        current_snapshot: dict[str, Any],
-    ) -> None:
-        prev_endpoints: dict[str, Any] = {}
-        if isinstance(previous_snapshot, dict):
-            candidate = previous_snapshot.get("endpoints")
-            if isinstance(candidate, dict):
-                prev_endpoints = candidate
-
-        for label, state in current_snapshot["endpoints"].items():
-            prev_state = prev_endpoints.get(label)
-            if prev_state == state:
-                continue
-            if state["status"] == "down":
-                logger.warning("health: {} unreachable: {}", label, state["error"])
-                continue
-            models = state["models"]
-            if prev_state is None or prev_state.get("status") != "up":
-                logger.info(
-                    "health: {} reachable, models: {}",
-                    label,
-                    ", ".join(models) if models else "none",
-                )
-                continue
-            prev_models = prev_state.get("models", [])
-            if prev_models != models:
-                logger.info(
-                    "health: {} models: {}",
-                    label,
-                    ", ".join(models) if models else "none",
-                )
 
     def _probe_models_sync(self, client: httpx.Client, endpoint: tuple[str, int]) -> tuple[tuple[str, ...], str | None]:
         models: tuple[str, ...] = ()
@@ -468,29 +452,30 @@ class LoadBalancerApp:
         return EndpointCheckResult(host=host, port=port, error="Healthcheck failed")
 
     def _summarize_health(self, results: list[EndpointCheckResult]) -> None:
-        previous_snapshot, current_snapshot, changed = self._stateful_health_snapshot(results)
+        _, current_snapshot, changed = self._stateful_health_snapshot(results)
         if not changed:
             return
         endpoints = current_snapshot["endpoints"]
+        headers = ["endpoint", "status", "models", "requests", "error"]
         if not endpoints:
-            logger.info("health: none")
+            logger.info("{}", tabulate([], headers=headers, tablefmt="simple"))
             return
         rows = [
             [
                 endpoint,
                 state["status"].upper(),
                 ",".join(state.get("models", ())) if state.get("models") else "-",
+                state.get("requests", 0),
                 state.get("error", "-"),
             ]
             for endpoint, state in endpoints.items()
         ]
         table = tabulate(
             rows,
-            headers=["endpoint", "status", "models", "error"],
+            headers=headers,
             tablefmt="simple",
         )
-        logger.info("health:\n{}", table)
-        self._log_health_changes(previous_snapshot, current_snapshot)
+        logger.info("{}", table)
 
     def _initial_healthcheck(self) -> list[EndpointCheckResult]:
         with httpx.Client(timeout=HEALTHCHECK_TIMEOUT_SECONDS) as client:
@@ -606,6 +591,11 @@ class LoadBalancerApp:
         except httpx.HTTPError as exc:
             await self._send_plain_error(send, 502, f"Upstream request failed: {exc}".encode("utf-8"))
             return
+
+        endpoint_label = self._endpoint_label_by_port.get(upstream_port, f"127.0.0.1:{upstream_port}")
+        self.endpoint_request_counts[endpoint_label] = (
+            self.endpoint_request_counts.get(endpoint_label, 0) + 1
+        )
 
         response_headers = [
             (key.encode("latin1"), value.encode("latin1"))

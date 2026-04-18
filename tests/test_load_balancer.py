@@ -331,15 +331,14 @@ def test_refresh_health_keeps_working_endpoints_and_warns_on_dead_ones(
         asyncio.run(app.refresh_health())
         captured = capsys.readouterr()
 
-        assert "health:" in captured.err
         assert "endpoint" in captured.err
         assert "status" in captured.err
+        assert "requests" in captured.err
         assert f"worker-1:8000 (local {upstream_ports[0]})" in captured.err
         assert f"worker-2:8000 (local {upstream_ports[1]})" in captured.err
         assert "UP" in captured.err
         assert "DOWN" in captured.err
-        assert "unreachable" in captured.err
-        assert f"worker-2:8000 (local {upstream_ports[1]}) unreachable" in captured.err
+        assert "Connection refused" in captured.err
         assert [endpoint.port for endpoint in app.valid_endpoints] == [upstream_ports[0]]
     finally:
         server_one.shutdown()
@@ -375,6 +374,26 @@ def test_refresh_health_logs_only_on_information_gain(monkeypatch, tmp_path: Pat
         server_one.shutdown()
         server_one.server_close()
         thread_one.join(timeout=5)
+
+
+def test_refresh_health_table_includes_request_counts(tmp_path: Path, capsys):
+    config_path = tmp_path / "config.yaml"
+    upstream_ports = find_free_port_block(1)
+    write_config(config_path, upstream_ports, 8001)
+    config_path.write_text(config_path.read_text() + f"  log-dir: {tmp_path / 'logs-c'}\n")
+
+    with run_stub_server(upstream_ports[0]):
+        app = load_balancer.create_app(config_path)
+        capsys.readouterr()
+        endpoint_label = app.upstream_endpoint_labels[("worker-1", upstream_ports[0])]
+        app.endpoint_request_counts[endpoint_label] = 5
+
+        asyncio.run(app.refresh_health())
+        captured = capsys.readouterr()
+
+    assert "requests" in captured.err
+    assert f"{endpoint_label}" in captured.err
+    assert "  5  " in captured.err
 
 
 def test_check_endpoint_sync_retries_transient_connection_errors(monkeypatch):
@@ -557,6 +576,31 @@ def test_verbose_prints_pretty_logged_payload(tmp_path: Path, capsys):
     assert f"endpoint=http://127.0.0.1:{upstream_ports[0]}/v1/chat/completions" in captured.err
     assert '"input": {' not in captured.err
     assert '"output": {' not in captured.err
+
+
+def test_verbose_request_response_log_is_rate_limited(monkeypatch, tmp_path: Path):
+    writer = load_balancer.AsyncFileLogWriter(tmp_path, verbose=True)
+    payload = {
+        "endpoint_used": "http://127.0.0.1:18000/v1/messages",
+        "route_reason": "affinity",
+    }
+    calls: list[tuple[str, tuple[object, ...]]] = []
+    ticks = iter([10.0, 10.5, 12.1])
+
+    monkeypatch.setattr(load_balancer.time, "monotonic", lambda: next(ticks))
+
+    def fake_info(message: str, *args: object):
+        calls.append((message, args))
+
+    monkeypatch.setattr(load_balancer.logger, "info", fake_info)
+
+    writer._print_logged_payload(tmp_path / "a.json", payload)
+    writer._print_logged_payload(tmp_path / "b.json", payload)
+    writer._print_logged_payload(tmp_path / "c.json", payload)
+
+    assert len(calls) == 2
+    assert calls[0][0] == "[request_response_log] log_path {} endpoint={} route={}"
+    assert calls[1][0] == "[request_response_log] log_path {} endpoint={} route={}"
 
 
 def test_proxies_streaming_response(tmp_path: Path):
