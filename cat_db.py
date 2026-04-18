@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import fcntl
 import os
 import pathlib
 import sqlite3
@@ -145,6 +146,20 @@ def read_key() -> str:
     try:
         tty.setraw(file_descriptor)
         first = sys.stdin.read(1)
+        if first == "G":
+            return "end"
+        if first == "g":
+            flags = fcntl.fcntl(file_descriptor, fcntl.F_GETFL)
+            fcntl.fcntl(file_descriptor, fcntl.F_SETFL, flags | os.O_NONBLOCK)
+            try:
+                next_char = sys.stdin.read(1)
+            except (BlockingIOError, OSError):
+                next_char = ""
+            finally:
+                fcntl.fcntl(file_descriptor, fcntl.F_SETFL, flags)
+            if next_char == "g":
+                return "home"
+            return "g"
         if first != "\x1b":
             return first
         second = sys.stdin.read(1)
@@ -153,6 +168,8 @@ def read_key() -> str:
             return "up"
         if second == "[" and third == "B":
             return "down"
+        if second == "O" and third == "F":
+            return "end"
         return first + second + third
     finally:
         termios.tcsetattr(file_descriptor, termios.TCSADRAIN, old_settings)
@@ -166,7 +183,7 @@ def browse_rows(rows: list[tuple[int, str, str, str]]) -> int:
         print()
         print(
             f"Navigation: {index + 1}/{len(rows)}"
-            "  Enter/down/j next  up/k previous  q quit"
+            "  Enter/down/j next  up/k previous  gg top  G bottom  q quit"
         )
         key = read_key()
         if key in {"q", "Q", "\x03"}:
@@ -175,6 +192,10 @@ def browse_rows(rows: list[tuple[int, str, str, str]]) -> int:
             index += 1
         if key in {"k", "K", "up"} and index > 0:
             index -= 1
+        if key == "home":
+            index = 0
+        if key == "end":
+            index = len(rows) - 1
     return 0
 
 

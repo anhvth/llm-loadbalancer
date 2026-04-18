@@ -253,3 +253,43 @@ def test_cat_db_uses_non_interactive_output_when_stdout_is_not_a_tty(monkeypatch
     assert captured.err == ""
     assert "Navigation" not in captured.out
     assert "Row 1" in captured.out
+
+
+class _FakeStdin:
+    def __init__(self, reads):
+        self._reads = list(reads)
+
+    def fileno(self):
+        return 0
+
+    def read(self, _size):
+        result = self._reads.pop(0)
+        if isinstance(result, BaseException):
+            raise result
+        return result
+
+
+def test_cat_db_read_key_maps_uppercase_g_to_end(monkeypatch):
+    monkeypatch.setattr(cat_db, "termios", type("FakeTermios", (), {"tcgetattr": staticmethod(lambda fd: "state"), "tcsetattr": staticmethod(lambda fd, when, state: None), "TCSADRAIN": object()})())
+    monkeypatch.setattr(cat_db, "tty", type("FakeTty", (), {"setraw": staticmethod(lambda fd: None)})())
+    monkeypatch.setattr(cat_db.sys, "stdin", _FakeStdin(["G"]))
+
+    assert cat_db.read_key() == "end"
+
+
+def test_cat_db_read_key_maps_double_g_to_home(monkeypatch):
+    monkeypatch.setattr(cat_db, "termios", type("FakeTermios", (), {"tcgetattr": staticmethod(lambda fd: "state"), "tcsetattr": staticmethod(lambda fd, when, state: None), "TCSADRAIN": object()})())
+    monkeypatch.setattr(cat_db, "tty", type("FakeTty", (), {"setraw": staticmethod(lambda fd: None)})())
+    monkeypatch.setattr(cat_db.sys, "stdin", _FakeStdin(["g", "g"]))
+    monkeypatch.setattr(cat_db.fcntl, "fcntl", lambda fd, op, arg=None: 0)
+
+    assert cat_db.read_key() == "home"
+
+
+def test_cat_db_read_key_handles_single_g_without_crashing(monkeypatch):
+    monkeypatch.setattr(cat_db, "termios", type("FakeTermios", (), {"tcgetattr": staticmethod(lambda fd: "state"), "tcsetattr": staticmethod(lambda fd, when, state: None), "TCSADRAIN": object()})())
+    monkeypatch.setattr(cat_db, "tty", type("FakeTty", (), {"setraw": staticmethod(lambda fd: None)})())
+    monkeypatch.setattr(cat_db.sys, "stdin", _FakeStdin(["g", BlockingIOError()]))
+    monkeypatch.setattr(cat_db.fcntl, "fcntl", lambda fd, op, arg=None: 0)
+
+    assert cat_db.read_key() == "g"
