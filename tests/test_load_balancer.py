@@ -354,6 +354,45 @@ def test_refresh_health_keeps_working_endpoints_and_warns_on_dead_ones(
         thread_two.join(timeout=5)
 
 
+def test_refresh_health_keeps_last_known_endpoints_when_all_checks_fail(
+    monkeypatch, tmp_path: Path, capsys
+):
+    config_path = tmp_path / "config.yaml"
+    upstream_ports = find_free_port_block(2)
+    write_config(config_path, upstream_ports, 8001)
+    config_path.write_text(config_path.read_text() + f"  log-dir: {tmp_path / 'logs-brownout'}\n")
+
+    initial_endpoints = [
+        load_balancer.EndpointCheckResult(host=f"worker-{index + 1}", port=port)
+        for index, port in enumerate(upstream_ports)
+    ]
+    monkeypatch.setattr(
+        load_balancer.LoadBalancerApp,
+        "_initial_healthcheck",
+        lambda self: initial_endpoints,
+    )
+
+    async def failing_check(_self, _client, endpoint):
+        host, port = endpoint
+        return load_balancer.EndpointCheckResult(
+            host=host,
+            port=port,
+            error="Healthcheck timeout",
+        )
+
+    monkeypatch.setattr(load_balancer.LoadBalancerApp, "_check_endpoint_async", failing_check)
+
+    app = load_balancer.create_app(config_path)
+    capsys.readouterr()
+
+    asyncio.run(app.refresh_health())
+    captured = capsys.readouterr()
+
+    assert [endpoint.port for endpoint in app.valid_endpoints] == upstream_ports
+    assert "DOWN" in captured.err
+    assert "Healthcheck timeout" in captured.err
+
+
 def test_refresh_health_logs_only_on_information_gain(monkeypatch, tmp_path: Path, capsys):
     config_path = tmp_path / "config.yaml"
     upstream_ports = find_free_port_block(2)
@@ -858,6 +897,46 @@ def test_affinity_lookup_normalizes_each_candidate_message_once(tmp_path: Path, 
 
     assert app._find_messages_affinity_port(lookup_payload) == upstream_ports[0]
     assert call_count == 1
+
+
+def test_choose_upstream_uses_request_endpoint_snapshot(tmp_path: Path, monkeypatch):
+    config_path = tmp_path / "config.yaml"
+    upstream_ports = find_free_port_block(2)
+    write_config(config_path, upstream_ports, 8001)
+
+    monkeypatch.setattr(
+        load_balancer.LoadBalancerApp,
+        "_initial_healthcheck",
+        lambda self: [
+            load_balancer.EndpointCheckResult(host=host, port=port)
+            for host, port in self.upstream_endpoints
+        ],
+    )
+    app = create_app(config_path)
+    request_body = json.dumps(
+        {"model": "demo", "messages": [{"role": "user", "content": "hi"}]}
+    ).encode("utf-8")
+    app._remember_messages_affinity(request_body, upstream_ports[0])
+
+    endpoint_snapshot = list(app.valid_endpoints)
+    app.valid_endpoints = []
+
+    upstream_port, route_reason = app._choose_upstream_port(
+        json.dumps(
+            {
+                "model": "demo",
+                "messages": [
+                    {"role": "user", "content": "hi"},
+                    {"role": "assistant", "content": "hello"},
+                    {"role": "user", "content": "tell me more"},
+                ],
+            }
+        ).encode("utf-8"),
+        endpoint_snapshot,
+    )
+
+    assert upstream_port == upstream_ports[0]
+    assert route_reason == "affinity"
 
 
 def test_sqlite_affinity_store_retries_transient_init_lock(tmp_path: Path, monkeypatch):

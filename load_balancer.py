@@ -630,7 +630,9 @@ class LoadBalancerApp:
             results = await asyncio.gather(
                 *(self._check_endpoint_async(client, endpoint) for endpoint in self.upstream_endpoints)
             )
-        self.valid_endpoints = [result for result in results if result.error is None]
+        valid_results = [result for result in results if result.error is None]
+        if valid_results or not self.valid_endpoints:
+            self.valid_endpoints = valid_results
         self._summarize_health(list(results))
 
     async def _healthcheck_loop(self) -> None:
@@ -699,7 +701,8 @@ class LoadBalancerApp:
         return httpx.AsyncClient(timeout=timeout, limits=limits)
 
     async def _handle_http(self, scope, receive, send) -> None:
-        if not self.valid_endpoints:
+        valid_endpoints = list(self.valid_endpoints)
+        if not valid_endpoints:
             await self._send_plain_error(send, 503, b"No upstream ports configured")
             return
 
@@ -722,7 +725,7 @@ class LoadBalancerApp:
                 break
 
         request_body = bytes(request_chunks)
-        upstream_port, route_reason = self._choose_upstream_port(request_body)
+        upstream_port, route_reason = self._choose_upstream_port(request_body, valid_endpoints)
         upstream_url = f"http://127.0.0.1:{upstream_port}{path}"
         headers = self._build_upstream_headers(scope["headers"], upstream_port)
         request = client.build_request(method, upstream_url, headers=headers, content=request_body)
@@ -807,8 +810,12 @@ class LoadBalancerApp:
         except json.JSONDecodeError:
             return None
 
-    def _choose_upstream_port(self, request_body: bytes) -> tuple[int, str]:
-        valid_ports = {endpoint.port for endpoint in self.valid_endpoints}
+    def _choose_upstream_port(
+        self,
+        request_body: bytes,
+        valid_endpoints: list[EndpointCheckResult],
+    ) -> tuple[int, str]:
+        valid_ports = {endpoint.port for endpoint in valid_endpoints}
         affinity_port = self._find_messages_affinity_port(request_body)
         if affinity_port is not None and affinity_port in valid_ports:
             return affinity_port, "affinity"
