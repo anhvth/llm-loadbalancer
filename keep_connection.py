@@ -4,8 +4,7 @@
 The current config format is intentionally simple:
 
 endpoints:
-  - worker-45:8000
-  - worker-41:8000
+  - worker-[41,45,49,53-54,57,59]:8000
 
 Optional keys:
   - remote-port: 8000

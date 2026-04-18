@@ -124,9 +124,41 @@ def test_start_everything_launches_tmux_before_load_balancer(monkeypatch, tmp_pa
     assert call_order[0][0] == "tmux"
     assert call_order[1] == ("serve", config_path, False)
     assert call_order[0][1] == "keepssh"
-    assert len(call_order[0][2]) == 2
+    assert len(call_order[0][2]) == 7
     assert call_order[0][2][0][5] == "50000:localhost:8000"
     assert call_order[0][2][1][5] == "50001:localhost:8000"
+
+
+def test_parse_config_supports_compact_endpoint_port_rows(monkeypatch, tmp_path):
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        "\n".join(
+            [
+                "endpoints:",
+                "  - worker-[41,45,49,53-54,57,59]:8000",
+                "port:",
+                "  - 8001",
+                "load-balancer:",
+                "  workers: 1",
+                "",
+            ]
+        )
+    )
+    monkeypatch.setattr(keep_connection, "find_free_port_start", lambda count, low=50000, high=65000: 50000)
+
+    cfg = keep_connection.parse_config(config_path)
+
+    assert cfg.hosts == [
+        "worker-41",
+        "worker-45",
+        "worker-49",
+        "worker-53",
+        "worker-54",
+        "worker-57",
+        "worker-59",
+    ]
+    assert cfg.remote_ports == [8000] * 7
+    assert cfg.port_start == 50000
 
 
 def test_main_returns_130_on_keyboard_interrupt(monkeypatch, tmp_path):
