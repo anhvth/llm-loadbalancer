@@ -84,16 +84,9 @@ class AsyncFileLogWriter:
 
     def _print_logged_payload(self, path: pathlib.Path, payload: dict[str, Any]) -> None:
         print(
-            "[request_response_log] wrote file:\n"
-            + json.dumps(
-                {
-                    "path": str(path),
-                    "input": payload.get("input", ""),
-                    "output": payload.get("output", ""),
-                    "endpoint_used": payload.get("endpoint_used", ""),
-                },
-                indent=2,
-            ),
+            "[request_response_log] "
+            f"log_path={path} "
+            f"endpoint={payload.get('endpoint_used', '')}",
             file=sys.stderr,
         )
 

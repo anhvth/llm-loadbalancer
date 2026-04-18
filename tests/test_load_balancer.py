@@ -377,10 +377,11 @@ def test_verbose_prints_pretty_logged_payload(tmp_path: Path, capsys):
 
     captured = capsys.readouterr()
     assert captured.out == ""
-    assert "[request_response_log] wrote file:\n" in captured.err
-    assert '"input": {' in captured.err
-    assert '"model": "demo"' in captured.err
-    assert f'"endpoint_used": "http://127.0.0.1:{upstream_ports[0]}/v1/chat/completions"' in captured.err
+    assert captured.err.count("[request_response_log]") == 1
+    assert str(db_path / "requests") in captured.err
+    assert f"endpoint=http://127.0.0.1:{upstream_ports[0]}/v1/chat/completions" in captured.err
+    assert '"input": {' not in captured.err
+    assert '"output": {' not in captured.err
 
 
 def test_proxies_streaming_response(tmp_path: Path):

@@ -6,14 +6,11 @@ OpenAI-like HTTP traffic to a random local upstream.
 ## Quick Start
 
 ```bash
-uvx --from llm-loadbalancer llmproxy
+uvx --from git+https://github.com/anhvth/llm-loadbalancer llmproxy --set-config
 ```
 
-Or with `uv run` inside a clone of this repo:
-
-```bash
-uv run llmproxy
-```
+Run that once on a new machine to create and open `config.yaml`. After saving
+it, run the same command without `--set-config` to start the service.
 
 ## Config
 
@@ -21,17 +18,17 @@ Example `config.yaml`:
 
 ```yaml
 endpoints:
-  - hosts: worker-[41,45,49,53-54,57,59,61]
-  - port-start: 18000
+  - hosts: <worker-host-pattern>
+  - port-start: <upstream-port-start>
 
 tmux:
-  session-name: keepssh
+  session-name: <tmux-session-name>
 
 port:
-  - 8001
+  - <listen-port>
 
 load-balancer:
-  workers: 20
+  workers: <worker-count>
   worker-concurrency: 512
   max-connections: 20000
   max-keepalive-connections: 4096
@@ -46,11 +43,10 @@ state in `~/.cache/llmup/affinity.sqlite3`.
 
 ### Commands
 
-- `uv run llmproxy` — start the load balancer (creates a default `config.yaml` if one does not exist)
-- `uv run llmproxy --set-config` — open the config file in your editor
-- `uv run llmproxy --silent` — disable printing each logged request/response file to stderr
-- `uv run cat_db` — inspect the request log directory in an interactive terminal
-- `uv run cat_db --raw` — print one JSON object per line (for scripting)
+- `uvx --from git+https://github.com/anhvth/llm-loadbalancer llmproxy --set-config` — create and open `config.yaml` on a new machine
+- `uvx --from git+https://github.com/anhvth/llm-loadbalancer llmproxy` — start the load balancer after config is set
+- `uvx --from git+https://github.com/anhvth/llm-loadbalancer cat_db` — inspect the request log directory in an interactive terminal
+- `uvx --from git+https://github.com/anhvth/llm-loadbalancer cat_db --raw` — print one JSON object per line for scripting
 
 ## Request Logging
 
@@ -70,9 +66,9 @@ workers through the SQLite database at `affinity-db`.
 Use `cat_db` to inspect the request log files with a readable pretty view by default:
 
 ```bash
-uv run cat_db
-uv run cat_db /path/to/custom-log-dir
-uv run cat_db --raw
+uvx --from git+https://github.com/anhvth/llm-loadbalancer cat_db
+uvx --from git+https://github.com/anhvth/llm-loadbalancer cat_db /path/to/custom-log-dir
+uvx --from git+https://github.com/anhvth/llm-loadbalancer cat_db --raw
 ```
 
 Without an argument, `cat_db` reads `~/.cache/llmup/logs`.
