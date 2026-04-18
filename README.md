@@ -6,7 +6,7 @@ OpenAI-like HTTP traffic to a random local upstream.
 ## Quick Start
 
 ```bash
-uvx --from git+https://github.com/anhvth/llm-loadbalancer llmproxy --set-config
+uvx --from git+https://github.com/anhvth/llm-loadbalancer llm-proxy --set-config
 ```
 
 Run that once on a new machine to create and open `~/.config/llm-proxy.yaml`.
@@ -41,8 +41,8 @@ automatically from a free high port range, so you do not need `port-start`.
 
 ### Commands
 
-- `uvx --from git+https://github.com/anhvth/llm-loadbalancer llmproxy --set-config` — create and open `~/.config/llm-proxy.yaml`
-- `uvx --from git+https://github.com/anhvth/llm-loadbalancer llmproxy` — start the load balancer after config is set
+- `uvx --from git+https://github.com/anhvth/llm-loadbalancer llm-proxy --set-config` — create and open `~/.config/llm-proxy.yaml`
+- `uvx --from git+https://github.com/anhvth/llm-loadbalancer llm-proxy` — start the load balancer after config is set
 - `uvx --from git+https://github.com/anhvth/llm-loadbalancer cat_db` — inspect the request log directory in an interactive terminal
 - `uvx --from git+https://github.com/anhvth/llm-loadbalancer cat_db --raw` — print one JSON object per line for scripting
 

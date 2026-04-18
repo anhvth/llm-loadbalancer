@@ -1,5 +1,6 @@
 import pathlib
 import json
+import subprocess
 
 import cat_db
 import keep_connection
@@ -172,6 +173,18 @@ def test_main_returns_130_on_keyboard_interrupt(monkeypatch, tmp_path):
     result = main.main(["--config", str(config_path)])
 
     assert result == 130
+
+
+def test_llm_proxy_entrypoint_is_available():
+    result = subprocess.run(
+        ["uv", "run", "llm-proxy", "--help"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0
+    assert "usage: llm-proxy" in result.stdout
 
 
 def write_log_dir(log_dir: pathlib.Path, rows: list[tuple[str, str, str]]):

@@ -12,6 +12,7 @@ dependencies = [
 
 [project.scripts]
 cat_db = "cat_db:main"
+llm-proxy = "main:main"
 llmproxy = "main:main"
 
 [build-system]
