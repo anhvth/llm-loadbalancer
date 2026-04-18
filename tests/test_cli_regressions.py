@@ -67,8 +67,8 @@ def test_main_defaults_to_current_directory_config(monkeypatch, tmp_path):
     monkeypatch.chdir(tmp_path)
     seen = []
 
-    def fake_start_everything(path):
-        seen.append(path)
+    def fake_start_everything(path, verbose=False):
+        seen.append((path, verbose))
         return 0
 
     monkeypatch.setattr(main, "start_everything", fake_start_everything)
@@ -76,7 +76,7 @@ def test_main_defaults_to_current_directory_config(monkeypatch, tmp_path):
     result = main.main([])
 
     assert result == 0
-    assert seen == [tmp_path / "config.yaml"]
+    assert seen == [(tmp_path / "config.yaml", False)]
 
 
 def test_main_passes_verbose_flag_to_start_everything(monkeypatch, tmp_path):
@@ -103,8 +103,8 @@ def test_start_everything_launches_tmux_before_load_balancer(monkeypatch, tmp_pa
     def fake_launch_in_tmux(session_name, commands):
         call_order.append(("tmux", session_name, commands))
 
-    def fake_serve_forever(path):
-        call_order.append(("serve", path))
+    def fake_serve_forever(path, verbose=False):
+        call_order.append(("serve", path, verbose))
 
     monkeypatch.setattr(main, "launch_in_tmux", fake_launch_in_tmux)
     monkeypatch.setattr(main, "serve_forever", fake_serve_forever)
@@ -113,7 +113,7 @@ def test_start_everything_launches_tmux_before_load_balancer(monkeypatch, tmp_pa
 
     assert result == 0
     assert call_order[0][0] == "tmux"
-    assert call_order[1] == ("serve", config_path)
+    assert call_order[1] == ("serve", config_path, False)
     assert call_order[0][1] == "keepssh"
     assert len(call_order[0][2]) == 8
     assert call_order[0][2][0][:4] == [
@@ -127,7 +127,7 @@ def test_start_everything_launches_tmux_before_load_balancer(monkeypatch, tmp_pa
 def test_main_returns_130_on_keyboard_interrupt(monkeypatch, tmp_path):
     config_path = tmp_path / "config.yaml"
 
-    def fake_start_everything(path):
+    def fake_start_everything(path, verbose=False):
         raise KeyboardInterrupt
 
     monkeypatch.setattr(main, "start_everything", fake_start_everything)
@@ -169,17 +169,12 @@ def test_cat_db_uses_default_path_in_current_directory(monkeypatch, tmp_path, ca
     captured = capsys.readouterr()
     assert result == 0
     assert captured.err == ""
-    assert captured.out == (
-        json.dumps(
-            {
-                "id": 1,
-                "input": '{"a":1}',
-                "output": '{"b":2}',
-                "endpoint_used": "http://127.0.0.1:18000/v1/chat/completions",
-            }
-        )
-        + "\n"
-    )
+    assert "Row 1" in captured.out
+    assert "endpoint_used: http://127.0.0.1:18000/v1/chat/completions" in captured.out
+    assert "input:" in captured.out
+    assert '"a": 1' in captured.out
+    assert "output:" in captured.out
+    assert '"b": 2' in captured.out
 
 
 def test_cat_db_accepts_explicit_db_path(tmp_path, capsys):
@@ -192,7 +187,7 @@ def test_cat_db_accepts_explicit_db_path(tmp_path, capsys):
         ],
     )
 
-    result = cat_db.main([str(db_path)])
+    result = cat_db.main(["--raw", str(db_path)])
 
     captured = capsys.readouterr()
     lines = captured.out.splitlines()
@@ -212,3 +207,49 @@ def test_cat_db_accepts_explicit_db_path(tmp_path, capsys):
             "endpoint_used": "http://127.0.0.1:18001/v1/chat/completions",
         },
     ]
+
+
+def test_cat_db_render_row_pretty_formats_messages_readably():
+    row = (
+        7,
+        json.dumps(
+            {
+                "model": "demo",
+                "messages": [
+                    {"role": "system", "content": "be concise"},
+                    {"role": "user", "content": "hello"},
+                ],
+            }
+        ),
+        json.dumps({"id": "resp_1", "choices": [{"message": {"role": "assistant", "content": "hi"}}]}),
+        "http://127.0.0.1:18000/v1/chat/completions",
+    )
+
+    rendered = cat_db.render_row_pretty(row)
+
+    assert "Row 7" in rendered
+    assert "input:" in rendered
+    assert "messages:" in rendered
+    assert "[1] system" in rendered
+    assert "content: be concise" in rendered
+    assert "[2] user" in rendered
+    assert "content: hello" in rendered
+    assert "output:" in rendered
+    assert '"id": "resp_1"' in rendered
+
+
+def test_cat_db_uses_non_interactive_output_when_stdout_is_not_a_tty(monkeypatch, tmp_path, capsys):
+    db_path = tmp_path / "custom.sqlite3"
+    write_log_db(
+        db_path,
+        [('{"a":1}', '{"b":2}', "http://127.0.0.1:18000/v1/chat/completions")],
+    )
+    monkeypatch.setattr(cat_db.sys.stdout, "isatty", lambda: False)
+
+    result = cat_db.main([str(db_path)])
+
+    captured = capsys.readouterr()
+    assert result == 0
+    assert captured.err == ""
+    assert "Navigation" not in captured.out
+    assert "Row 1" in captured.out
