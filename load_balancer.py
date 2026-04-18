@@ -109,9 +109,10 @@ class AsyncFileLogWriter:
 
     def _print_logged_payload(self, path: pathlib.Path, payload: dict[str, Any]) -> None:
         logger.info(
-            "[request_response_log] log_path {} endpoint={}",
+            "[request_response_log] log_path {} endpoint={} route={}",
             path,
             payload.get("endpoint_used", ""),
+            payload.get("route_reason", ""),
         )
 
 
@@ -562,7 +563,7 @@ class LoadBalancerApp:
                 break
 
         request_body = bytes(request_chunks)
-        upstream_port = self._choose_upstream_port(request_body)
+        upstream_port, route_reason = self._choose_upstream_port(request_body)
         upstream_url = f"http://127.0.0.1:{upstream_port}{path}"
         headers = self._build_upstream_headers(scope["headers"], upstream_port)
         request = client.build_request(method, upstream_url, headers=headers, content=request_body)
@@ -604,6 +605,7 @@ class LoadBalancerApp:
             bytes(response_chunks),
             upstream_url,
             response.headers.get("content-type"),
+            route_reason=route_reason,
         )
 
     def _build_upstream_headers(self, headers, upstream_port: int) -> list[tuple[str, str]]:
@@ -641,11 +643,12 @@ class LoadBalancerApp:
         except json.JSONDecodeError:
             return None
 
-    def _choose_upstream_port(self, request_body: bytes) -> int:
+    def _choose_upstream_port(self, request_body: bytes) -> tuple[int, str]:
+        valid_ports = {endpoint.port for endpoint in self.valid_endpoints}
         affinity_port = self._find_messages_affinity_port(request_body)
-        if affinity_port is not None:
-            return affinity_port
-        return random.choice([endpoint.port for endpoint in self.valid_endpoints])
+        if affinity_port is not None and affinity_port in valid_ports:
+            return affinity_port, "affinity"
+        return random.choice(list(valid_ports)), "random"
 
     def _find_messages_affinity_port(self, request_body: bytes) -> int | None:
         payload = self._decode_json_value(self._decode_body_text(request_body))
@@ -864,6 +867,7 @@ class LoadBalancerApp:
         response_body: bytes,
         endpoint_used: str,
         content_type: str | None = None,
+        route_reason: str = "unknown",
     ) -> None:
         try:
             request_text = self._decode_body_text(request_body)
@@ -887,6 +891,7 @@ class LoadBalancerApp:
                 "input": request_json,
                 "output": response_json,
                 "endpoint_used": endpoint_used,
+                "route_reason": route_reason,
             }
         )
 
