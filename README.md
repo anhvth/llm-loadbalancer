@@ -9,13 +9,13 @@ OpenAI-like HTTP traffic to a random local upstream.
 uvx --from git+https://github.com/anhvth/llm-loadbalancer llmproxy --set-config
 ```
 
-Run that once on a new machine to create and open `~/.cache/llmup/config.yaml`.
+Run that once on a new machine to create and open `~/.config/llm-proxy.yaml`.
 After saving it, run the same command without `--set-config` to start the
 service.
 
 ## Config
 
-Example `config.yaml`:
+Example [`example_config.yaml`](/Users/anhvth/projects/llm-loadbalancer/example_config.yaml):
 
 ```yaml
 endpoints:
@@ -30,18 +30,18 @@ load-balancer:
   max-connections: 20000
   max-keepalive-connections: 4096
   upstream-timeout: 300
-  log-dir: ~/.cache/llmup/logs
-  affinity-db: ~/.cache/llmup/affinity.sqlite3
+  log-dir: ~/.cache/llm-proxy/logs
+  affinity-db: ~/.cache/llm-proxy/affinity.sqlite3
 ```
 
 `log-dir` and `affinity-db` are optional. If omitted, the load balancer writes
-request log files to `~/.cache/llmup/logs` and stores shared message-affinity
-state in `~/.cache/llmup/affinity.sqlite3`. Local SSH tunnel ports are chosen
+request log files to `~/.cache/llm-proxy/logs` and stores shared message-affinity
+state in `~/.cache/llm-proxy/affinity.sqlite3`. Local SSH tunnel ports are chosen
 automatically from a free high port range, so you do not need `port-start`.
 
 ### Commands
 
-- `uvx --from git+https://github.com/anhvth/llm-loadbalancer llmproxy --set-config` — create and open `~/.cache/llmup/config.yaml`
+- `uvx --from git+https://github.com/anhvth/llm-loadbalancer llmproxy --set-config` — create and open `~/.config/llm-proxy.yaml`
 - `uvx --from git+https://github.com/anhvth/llm-loadbalancer llmproxy` — start the load balancer after config is set
 - `uvx --from git+https://github.com/anhvth/llm-loadbalancer cat_db` — inspect the request log directory in an interactive terminal
 - `uvx --from git+https://github.com/anhvth/llm-loadbalancer cat_db --raw` — print one JSON object per line for scripting
@@ -69,7 +69,7 @@ uvx --from git+https://github.com/anhvth/llm-loadbalancer cat_db /path/to/custom
 uvx --from git+https://github.com/anhvth/llm-loadbalancer cat_db --raw
 ```
 
-Without an argument, `cat_db` reads `~/.cache/llmup/logs`.
+Without an argument, `cat_db` reads `~/.cache/llm-proxy/logs`.
 
 - Default mode formats one request at a time and, in an interactive terminal, lets
   you move with `Enter`, arrow keys, `j`/`k`, `gg`/`G`, and quit with `q`.

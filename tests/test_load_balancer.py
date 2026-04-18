@@ -618,8 +618,8 @@ def test_parse_config_resolves_default_db_path_relative_to_config(tmp_path: Path
 
     cfg = parse_config(config_path)
 
-    assert cfg.load_balancer_log_dir == Path("~/.cache/llmup/logs").expanduser()
-    assert cfg.load_balancer_affinity_db_path == Path("~/.cache/llmup/affinity.sqlite3").expanduser()
+    assert cfg.load_balancer_log_dir == Path("~/.cache/llm-proxy/logs").expanduser()
+    assert cfg.load_balancer_affinity_db_path == Path("~/.cache/llm-proxy/affinity.sqlite3").expanduser()
 
 
 def test_serve_forever_does_not_enable_reload(monkeypatch, tmp_path: Path):

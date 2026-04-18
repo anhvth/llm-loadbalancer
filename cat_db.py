@@ -21,8 +21,8 @@ REQUEST_LOGS_DIRNAME = "requests"
 
 def default_log_dir() -> pathlib.Path:
     for config_path in (
-        pathlib.Path(os.environ.get("LLM_LOADBALANCER_CONFIG", "~/.cache/llmup/config.yaml")).expanduser(),
-        pathlib.Path("config.yaml"),
+        pathlib.Path(os.environ.get("LLM_PROXY_CONFIG", "~/.config/llm-proxy.yaml")).expanduser(),
+        pathlib.Path("example_config.yaml"),
     ):
         if config_path.exists():
             try:
@@ -33,7 +33,7 @@ def default_log_dir() -> pathlib.Path:
                             return pathlib.Path(log_dir).expanduser()
             except Exception:
                 pass
-    return pathlib.Path("~/.cache/llmup/logs").expanduser()
+    return pathlib.Path("~/.cache/llm-proxy/logs").expanduser()
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -50,7 +50,7 @@ def build_parser() -> argparse.ArgumentParser:
         nargs="?",
         type=pathlib.Path,
         default=default_log_dir(),
-        help="Path to the request log directory. Defaults to ~/.cache/llmup/logs",
+        help="Path to the request log directory. Defaults to ~/.cache/llm-proxy/logs",
     )
     return parser
 

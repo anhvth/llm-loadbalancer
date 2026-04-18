@@ -22,13 +22,13 @@ load-balancer:
   max-connections: 20000
   max-keepalive-connections: 4096
   upstream-timeout: 300
-  log-dir: ~/.cache/llmup/logs
-  affinity-db: ~/.cache/llmup/affinity.sqlite3
+  log-dir: ~/.cache/llm-proxy/logs
+  affinity-db: ~/.cache/llm-proxy/affinity.sqlite3
 """
 
 
 def default_config_path() -> pathlib.Path:
-    return pathlib.Path("~/.cache/llmup/config.yaml").expanduser()
+    return pathlib.Path("~/.config/llm-proxy.yaml").expanduser()
 
 
 def ensure_config_exists(config_path: pathlib.Path) -> None:
@@ -76,7 +76,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--config",
         type=pathlib.Path,
         default=default_config_path(),
-        help="Path to config.yaml. Defaults to ~/.cache/llmup/config.yaml",
+        help="Path to config file. Defaults to ~/.config/llm-proxy.yaml",
     )
     parser.add_argument(
         "--set-config",

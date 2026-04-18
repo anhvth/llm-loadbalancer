@@ -43,9 +43,9 @@ class TunnelConfig:
     load_balancer_max_connections: int = 20000
     load_balancer_max_keepalive_connections: int = 4096
     load_balancer_upstream_timeout: float = 300.0
-    load_balancer_log_dir: pathlib.Path = pathlib.Path("~/.cache/llmup/logs").expanduser()
+    load_balancer_log_dir: pathlib.Path = pathlib.Path("~/.cache/llm-proxy/logs").expanduser()
     load_balancer_affinity_db_path: pathlib.Path = pathlib.Path(
-        "~/.cache/llmup/affinity.sqlite3"
+        "~/.cache/llm-proxy/affinity.sqlite3"
     ).expanduser()
     user: str | None = None
     ssh_options: list[str] = dataclasses.field(default_factory=list)
@@ -223,11 +223,11 @@ def parse_config(path: pathlib.Path) -> TunnelConfig:
     load_balancer_upstream_timeout = float(load_balancer.get("upstream-timeout", "300"))
     load_balancer_log_dir = resolve_config_relative_path(
         path,
-        load_balancer.get("log-dir", "~/.cache/llmup/logs")
+        load_balancer.get("log-dir", "~/.cache/llm-proxy/logs")
     )
     load_balancer_affinity_db_path = resolve_config_relative_path(
         path,
-        load_balancer.get("affinity-db", "~/.cache/llmup/affinity.sqlite3")
+        load_balancer.get("affinity-db", "~/.cache/llm-proxy/affinity.sqlite3")
     )
     user = merged.get("user")
     ssh_options = shlex.split(merged.get("ssh-options", ""))
@@ -341,12 +341,12 @@ def launch_in_tmux(session_name: str, commands: list[list[str]]) -> None:
 
 
 def main(argv: list[str]) -> int:
-    parser = argparse.ArgumentParser(description="Keep SSH tunnels alive from config.yaml")
+    parser = argparse.ArgumentParser(description="Keep SSH tunnels alive from the config file")
     parser.add_argument(
         "-c",
         "--config",
         type=pathlib.Path,
-        default=pathlib.Path("~/.cache/llmup/config.yaml").expanduser(),
+        default=pathlib.Path("~/.config/llm-proxy.yaml").expanduser(),
         help="Path to the tunnel config",
     )
     parser.add_argument(

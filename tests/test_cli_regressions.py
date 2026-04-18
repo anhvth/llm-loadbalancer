@@ -9,7 +9,7 @@ import main
 def test_default_config_path_uses_cache_directory(monkeypatch, tmp_path):
     monkeypatch.setenv("HOME", str(tmp_path))
 
-    assert main.default_config_path() == tmp_path / ".cache" / "llmup" / "config.yaml"
+    assert main.default_config_path() == tmp_path / ".config" / "llm-proxy.yaml"
 
 
 def test_ensure_config_exists_creates_expected_default_file(tmp_path):
@@ -21,7 +21,7 @@ def test_ensure_config_exists_creates_expected_default_file(tmp_path):
 
 
 def test_ensure_config_exists_creates_parent_directories(tmp_path):
-    config_path = tmp_path / ".cache" / "llmup" / "config.yaml"
+    config_path = tmp_path / ".config" / "llm-proxy.yaml"
 
     main.ensure_config_exists(config_path)
 
@@ -84,7 +84,7 @@ def test_main_defaults_to_cache_config(monkeypatch, tmp_path):
     result = main.main([])
 
     assert result == 0
-    assert seen == [(tmp_path / ".cache" / "llmup" / "config.yaml", True)]
+    assert seen == [(tmp_path / ".config" / "llm-proxy.yaml", True)]
 
 
 def test_main_passes_silent_flag_to_start_everything(monkeypatch, tmp_path):
@@ -191,7 +191,7 @@ def write_log_dir(log_dir: pathlib.Path, rows: list[tuple[str, str, str]]):
 
 
 def test_cat_db_uses_default_cache_path(monkeypatch, tmp_path, capsys):
-    db_path = tmp_path / "cache-home" / ".cache" / "llmup" / "logs"
+    db_path = tmp_path / "cache-home" / ".cache" / "llm-proxy" / "logs"
     monkeypatch.setenv("HOME", str(tmp_path / "cache-home"))
     write_log_dir(
         db_path,
@@ -209,6 +209,25 @@ def test_cat_db_uses_default_cache_path(monkeypatch, tmp_path, capsys):
     assert '"a": 1' in captured.out
     assert "output:" in captured.out
     assert '"b": 2' in captured.out
+
+
+def test_cat_db_defaults_to_example_config_path(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "example_config.yaml").write_text(
+        "\n".join(
+            [
+                "endpoints:",
+                "  - worker-[41,45,49,53-54,57,59]:8000",
+                "port:",
+                "  - 8001",
+                "load-balancer:",
+                "  log-dir: ~/.cache/llm-proxy/logs",
+                "",
+            ]
+        )
+    )
+
+    assert cat_db.default_log_dir() == pathlib.Path("~/.cache/llm-proxy/logs").expanduser()
 
 
 def test_cat_db_accepts_explicit_db_path(tmp_path, capsys):

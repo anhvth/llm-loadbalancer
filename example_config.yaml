@@ -10,5 +10,5 @@ load-balancer:
   max-connections: 20000
   max-keepalive-connections: 4096
   upstream-timeout: 300
-  log-dir: ~/.cache/llmup/logs
-  affinity-db: ~/.cache/llmup/affinity.sqlite3
+  log-dir: ~/.cache/llm-proxy/logs
+  affinity-db: ~/.cache/llm-proxy/affinity.sqlite3

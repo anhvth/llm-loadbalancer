@@ -574,24 +574,24 @@ def resolve_config_path(config_path: pathlib.Path | None = None) -> pathlib.Path
     if config_path is not None:
         return config_path
     return pathlib.Path(
-        os.environ.get("LLM_LOADBALANCER_CONFIG", "~/.cache/llmup/config.yaml")
+        os.environ.get("LLM_PROXY_CONFIG", "~/.config/llm-proxy.yaml")
     ).expanduser()
 
 
 def create_app(config_path: pathlib.Path | None = None, verbose: bool | None = None) -> LoadBalancerApp:
     cfg = parse_config(resolve_config_path(config_path))
     if verbose is None:
-        verbose = os.environ.get("LLM_LOADBALANCER_VERBOSE", "0") == "1"
+        verbose = os.environ.get("LLM_PROXY_VERBOSE", "0") == "1"
     return LoadBalancerApp(cfg, verbose=verbose)
 
 
 def serve_forever(
-    config_path: pathlib.Path = pathlib.Path("~/.cache/llmup/config.yaml").expanduser(),
+    config_path: pathlib.Path = pathlib.Path("~/.config/llm-proxy.yaml").expanduser(),
     verbose: bool = True,
 ) -> None:
     cfg = parse_config(config_path)
-    os.environ["LLM_LOADBALANCER_CONFIG"] = str(config_path)
-    os.environ["LLM_LOADBALANCER_VERBOSE"] = "1" if verbose else "0"
+    os.environ["LLM_PROXY_CONFIG"] = str(config_path)
+    os.environ["LLM_PROXY_VERBOSE"] = "1" if verbose else "0"
     uvicorn.run(
         "load_balancer:create_app",
         factory=True,
@@ -612,7 +612,7 @@ def main(argv: list[str] | None = None) -> int:
         "-c",
         "--config",
         type=pathlib.Path,
-        default=pathlib.Path("~/.cache/llmup/config.yaml").expanduser(),
+        default=pathlib.Path("~/.config/llm-proxy.yaml").expanduser(),
         help="Path to the shared config file",
     )
     parser.add_argument(
@@ -622,7 +622,7 @@ def main(argv: list[str] | None = None) -> int:
         help="Disable verbose logging to terminal",
     )
     args = parser.parse_args(argv)
-    verbose = not args.silent and os.environ.get("LLM_LOADBALANCER_VERBOSE", "1") == "1"
+    verbose = not args.silent and os.environ.get("LLM_PROXY_VERBOSE", "1") == "1"
     serve_forever(args.config, verbose=verbose)
     return 0
 
