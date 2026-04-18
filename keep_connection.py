@@ -11,7 +11,7 @@ Optional keys:
   - user: myuser
   - ssh-options: -o ServerAliveInterval=30 -o ServerAliveCountMax=3
   - tmux.session-name: keepssh
-  - port-start: 50000
+  - port-start: 18000
 
 The script can print the commands it would run, or launch them and restart
 failed tunnels.
@@ -22,13 +22,22 @@ from __future__ import annotations
 import argparse
 import dataclasses
 import pathlib
-import random
 import re
 import shlex
 import subprocess
 import sys
-import socket
 from typing import Iterable
+
+from loguru import logger
+
+logger.remove()
+
+
+def _log_sink(message):
+    sys.stderr.write(str(message))
+
+
+logger.add(_log_sink, format="{message}", level="INFO")
 
 
 @dataclasses.dataclass(frozen=True)
@@ -40,9 +49,7 @@ class TunnelConfig:
     listen_port: int = 8001
     load_balancer_workers: int = 20
     load_balancer_worker_concurrency: int = 512
-    load_balancer_max_connections: int = 20000
-    load_balancer_max_keepalive_connections: int = 4096
-    load_balancer_upstream_timeout: float = 300.0
+    load_balancer_health_path: str = "/models"
     load_balancer_log_dir: pathlib.Path = pathlib.Path("~/.cache/llm-proxy/logs").expanduser()
     load_balancer_affinity_db_path: pathlib.Path = pathlib.Path(
         "~/.cache/llm-proxy/affinity.sqlite3"
@@ -50,6 +57,9 @@ class TunnelConfig:
     user: str | None = None
     ssh_options: list[str] = dataclasses.field(default_factory=list)
     tmux_session_name: str = "keepssh"
+
+
+DEFAULT_PORT_START = 18000
 
 
 def strip_comment(line: str) -> str:
@@ -87,30 +97,6 @@ def resolve_config_relative_path(config_path: pathlib.Path, raw_path: str) -> pa
     if candidate.is_absolute():
         return candidate
     return config_path.parent / candidate
-
-
-def _is_port_free(port: int) -> bool:
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-        try:
-            sock.bind(("127.0.0.1", port))
-        except OSError:
-            return False
-    return True
-
-
-def find_free_port_start(count: int, low: int = 50000, high: int = 65000) -> int:
-    if count <= 0:
-        raise ValueError("count must be positive")
-    max_start = high - count + 1
-    if max_start < low:
-        raise ValueError("Port range is too small for the requested number of tunnels")
-
-    candidates = list(range(low, max_start + 1))
-    random.shuffle(candidates)
-    for start in candidates:
-        if all(_is_port_free(start + offset) for offset in range(count)):
-            return start
-    raise RuntimeError("Could not find a free tunnel port range")
 
 
 def _expand_endpoint_hosts(raw_host: str) -> list[str]:
@@ -209,18 +195,16 @@ def parse_config(path: pathlib.Path) -> TunnelConfig:
 
     port_start_raw = merged.get("port-start")
     if port_start_raw is None:
-        port_start = find_free_port_start(len(hosts))
+        port_start = DEFAULT_PORT_START
     else:
         port_start = int(port_start_raw)
 
     listen_port = int(ports[0]) if ports else int(merged.get("listen-port", "8001"))
     load_balancer_workers = int(load_balancer.get("workers", "20"))
     load_balancer_worker_concurrency = int(load_balancer.get("worker-concurrency", "512"))
-    load_balancer_max_connections = int(load_balancer.get("max-connections", "20000"))
-    load_balancer_max_keepalive_connections = int(
-        load_balancer.get("max-keepalive-connections", "4096")
-    )
-    load_balancer_upstream_timeout = float(load_balancer.get("upstream-timeout", "300"))
+    load_balancer_health_path = load_balancer.get("health-path", "/models")
+    if not load_balancer_health_path.startswith("/"):
+        load_balancer_health_path = f"/{load_balancer_health_path}"
     load_balancer_log_dir = resolve_config_relative_path(
         path,
         load_balancer.get("log-dir", "~/.cache/llm-proxy/logs")
@@ -241,9 +225,7 @@ def parse_config(path: pathlib.Path) -> TunnelConfig:
         listen_port=listen_port,
         load_balancer_workers=load_balancer_workers,
         load_balancer_worker_concurrency=load_balancer_worker_concurrency,
-        load_balancer_max_connections=load_balancer_max_connections,
-        load_balancer_max_keepalive_connections=load_balancer_max_keepalive_connections,
-        load_balancer_upstream_timeout=load_balancer_upstream_timeout,
+        load_balancer_health_path=load_balancer_health_path,
         load_balancer_log_dir=load_balancer_log_dir,
         load_balancer_affinity_db_path=load_balancer_affinity_db_path,
         user=user,
@@ -360,21 +342,21 @@ def main(argv: list[str]) -> int:
     commands = list(iter_commands(cfg))
 
     for cmd in commands:
-        print(shlex.join(cmd))
+        logger.info(shlex.join(cmd))
 
     if args.print_only:
         return 0
 
     try:
         launch_in_tmux(cfg.tmux_session_name, commands)
-        print(f"Started tunnels in tmux session: {cfg.tmux_session_name}", file=sys.stderr)
+        logger.info("Started tunnels in tmux session: {}", cfg.tmux_session_name)
     except KeyboardInterrupt:
         return 130
     except subprocess.CalledProcessError as exc:
-        print(f"Failed to start tmux command: {exc}", file=sys.stderr)
+        logger.error("Failed to start tmux command: {}", exc)
         return 1
     except RuntimeError as exc:
-        print(str(exc), file=sys.stderr)
+        logger.error("{}", exc)
         return 1
 
     return 0

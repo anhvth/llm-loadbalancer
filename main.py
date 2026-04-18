@@ -6,8 +6,19 @@ import pathlib
 import subprocess
 import sys
 
+from loguru import logger
+
 from keep_connection import iter_commands, launch_in_tmux, parse_config
 from load_balancer import serve_forever
+
+logger.remove()
+
+
+def _log_sink(message):
+    sys.stderr.write(str(message))
+
+
+logger.add(_log_sink, format="{message}", level="INFO")
 
 DEFAULT_CONFIG = """# Replace the worker host entries with your actual SSH targets.
 endpoints:
@@ -19,11 +30,11 @@ port:
 load-balancer:
   workers: 20
   worker-concurrency: 512
-  max-connections: 20000
-  max-keepalive-connections: 4096
-  upstream-timeout: 300
+  health-path: /models
   log-dir: ~/.cache/llm-proxy/logs
   affinity-db: ~/.cache/llm-proxy/affinity.sqlite3
+
+port-start: 18000
 """
 
 
@@ -54,16 +65,51 @@ def open_config_in_editor(config_path: pathlib.Path) -> int:
         except FileNotFoundError:
             continue
 
-    print(f"Config file is at {config_path}", file=sys.stderr)
+    logger.info("Config file is at {}", config_path)
     return 0
+
+
+def format_config_table(config_path: pathlib.Path, cfg) -> str:
+    endpoint_rows = [
+        f"{host}:{remote_port}"
+        for host, remote_port in zip(cfg.hosts, cfg.remote_ports or [cfg.remote_port] * len(cfg.hosts))
+    ]
+    rows = [
+        ("config-path", str(config_path)),
+        ("endpoints", ", ".join(endpoint_rows) if endpoint_rows else "-"),
+        ("listen-port", str(cfg.listen_port)),
+        ("port-start", str(cfg.port_start)),
+        ("tmux-session", cfg.tmux_session_name),
+        ("ssh-user", cfg.user or "-"),
+        ("ssh-options", " ".join(cfg.ssh_options) if cfg.ssh_options else "-"),
+        ("lb-workers", str(cfg.load_balancer_workers)),
+        ("lb-worker-concurrency", str(cfg.load_balancer_worker_concurrency)),
+        ("lb-health-path", cfg.load_balancer_health_path),
+        ("lb-log-dir", str(cfg.load_balancer_log_dir)),
+        ("lb-affinity-db", str(cfg.load_balancer_affinity_db_path)),
+    ]
+    key_width = max(len("key"), max(len(key) for key, _ in rows))
+    value_width = max(len("value"), max(len(value) for _, value in rows))
+    separator = f"+-{'-' * key_width}-+-{'-' * value_width}-+"
+    lines = [
+        separator,
+        f"| {'key'.ljust(key_width)} | {'value'.ljust(value_width)} |",
+        separator,
+    ]
+    for key, value in rows:
+        lines.append(f"| {key.ljust(key_width)} | {value.ljust(value_width)} |")
+    lines.append(separator)
+    return "\n".join(lines)
 
 
 def start_everything(config_path: pathlib.Path, verbose: bool = False) -> int:
     ensure_config_exists(config_path)
     cfg = parse_config(config_path)
+    logger.info("Using config file: {}", config_path)
+    logger.info("Loaded config:\n{}", format_config_table(config_path, cfg))
     commands = list(iter_commands(cfg))
     launch_in_tmux(cfg.tmux_session_name, commands)
-    print(f"Started SSH tunnels in tmux session: {cfg.tmux_session_name}", file=sys.stderr)
+    logger.info("Started SSH tunnels in tmux session: {}", cfg.tmux_session_name)
     serve_forever(config_path, verbose=verbose)
     return 0
 

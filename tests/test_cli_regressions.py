@@ -115,7 +115,6 @@ def test_start_everything_launches_tmux_before_load_balancer(monkeypatch, tmp_pa
     def fake_serve_forever(path, verbose=False):
         call_order.append(("serve", path, verbose))
 
-    monkeypatch.setattr(keep_connection, "find_free_port_start", lambda count, low=50000, high=65000: 50000)
     monkeypatch.setattr(main, "launch_in_tmux", fake_launch_in_tmux)
     monkeypatch.setattr(main, "serve_forever", fake_serve_forever)
 
@@ -126,8 +125,32 @@ def test_start_everything_launches_tmux_before_load_balancer(monkeypatch, tmp_pa
     assert call_order[1] == ("serve", config_path, False)
     assert call_order[0][1] == "keepssh"
     assert len(call_order[0][2]) == 7
-    assert call_order[0][2][0][5] == "50000:localhost:8000"
-    assert call_order[0][2][1][5] == "50001:localhost:8000"
+    assert call_order[0][2][0][5] == "18000:localhost:8000"
+    assert call_order[0][2][1][5] == "18001:localhost:8000"
+
+
+def test_start_everything_logs_config_path_and_table(monkeypatch, tmp_path):
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(main.DEFAULT_CONFIG)
+    logs = []
+
+    def fake_info(message, *args):
+        logs.append(message.format(*args))
+
+    monkeypatch.setattr(main.logger, "info", fake_info)
+    monkeypatch.setattr(main, "launch_in_tmux", lambda *args, **kwargs: None)
+    monkeypatch.setattr(main, "serve_forever", lambda *args, **kwargs: None)
+
+    result = main.start_everything(config_path)
+
+    assert result == 0
+    assert any(f"Using config file: {config_path}" in line for line in logs)
+    table_logs = [line for line in logs if line.startswith("Loaded config:\n+")]
+    assert len(table_logs) == 1
+    assert "config-path" in table_logs[0]
+    assert str(config_path) in table_logs[0]
+    assert "endpoints" in table_logs[0]
+    assert "worker-41:8000" in table_logs[0]
 
 
 def test_parse_config_supports_compact_endpoint_port_rows(monkeypatch, tmp_path):
@@ -145,8 +168,6 @@ def test_parse_config_supports_compact_endpoint_port_rows(monkeypatch, tmp_path)
             ]
         )
     )
-    monkeypatch.setattr(keep_connection, "find_free_port_start", lambda count, low=50000, high=65000: 50000)
-
     cfg = keep_connection.parse_config(config_path)
 
     assert cfg.hosts == [
@@ -159,7 +180,8 @@ def test_parse_config_supports_compact_endpoint_port_rows(monkeypatch, tmp_path)
         "worker-59",
     ]
     assert cfg.remote_ports == [8000] * 7
-    assert cfg.port_start == 50000
+    assert cfg.port_start == 18000
+    assert cfg.load_balancer_health_path == "/models"
 
 
 def test_main_returns_130_on_keyboard_interrupt(monkeypatch, tmp_path):

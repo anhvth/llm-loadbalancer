@@ -4,6 +4,9 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
+import dataclasses
+import fcntl
 import hashlib
 import json
 import os
@@ -18,6 +21,7 @@ from typing import Any
 import uuid
 
 import httpx
+from loguru import logger
 import uvicorn
 
 from keep_connection import TunnelConfig, parse_config
@@ -36,6 +40,27 @@ HOP_BY_HOP_HEADERS = {
 MESSAGE_AFFINITY_CACHE_SIZE = 4096
 MESSAGE_AFFINITY_IGNORED_KEYS = {"cache_control", "role", "signature", "type"}
 REQUEST_LOGS_DIRNAME = "requests"
+UPSTREAM_TIMEOUT_SECONDS = 300.0
+HEALTHCHECK_TIMEOUT_SECONDS = 2.0
+HEALTHCHECK_INTERVAL_SECONDS = 30.0
+HEALTHCHECK_STATE_FILENAME = "health_state.json"
+
+logger.remove()
+
+
+def _log_sink(message):
+    sys.stderr.write(str(message))
+
+
+logger.add(_log_sink, format="{message}", level="INFO")
+
+
+@dataclasses.dataclass(frozen=True)
+class EndpointCheckResult:
+    host: str
+    port: int
+    models: tuple[str, ...] = ()
+    error: str | None = None
 
 
 class AsyncFileLogWriter:
@@ -83,11 +108,10 @@ class AsyncFileLogWriter:
         return final_path
 
     def _print_logged_payload(self, path: pathlib.Path, payload: dict[str, Any]) -> None:
-        print(
-            "[request_response_log] "
-            f"log_path={path} "
-            f"endpoint={payload.get('endpoint_used', '')}",
-            file=sys.stderr,
+        logger.info(
+            "[request_response_log] log_path {} endpoint={}",
+            path,
+            payload.get("endpoint_used", ""),
         )
 
 
@@ -160,21 +184,307 @@ class SqliteMessageAffinityStore:
             )
 
 
-def build_upstream_ports(cfg: TunnelConfig) -> list[int]:
-    return [cfg.port_start + index for index in range(len(cfg.hosts))]
+def build_upstream_endpoints(cfg: TunnelConfig) -> list[tuple[str, int]]:
+    return [(host, cfg.port_start + index) for index, host in enumerate(cfg.hosts)]
+
+
+def build_upstream_endpoint_labels(cfg: TunnelConfig) -> dict[tuple[str, int], str]:
+    remote_ports = cfg.remote_ports or [cfg.remote_port] * len(cfg.hosts)
+    labels: dict[tuple[str, int], str] = {}
+    for index, (host, remote_port) in enumerate(zip(cfg.hosts, remote_ports)):
+        local_port = cfg.port_start + index
+        key = (host, local_port)
+        if local_port == remote_port:
+            labels[key] = f"{host}:{local_port}"
+        else:
+            labels[key] = f"{host}:{remote_port} (local {local_port})"
+    return labels
 
 
 class LoadBalancerApp:
     def __init__(self, cfg: TunnelConfig, verbose: bool = True):
         self.cfg = cfg
         self.verbose = verbose
-        self.upstream_ports = build_upstream_ports(cfg)
+        self.upstream_endpoints = build_upstream_endpoints(cfg)
+        self.upstream_endpoint_labels = build_upstream_endpoint_labels(cfg)
+        self._health_state_path = self.cfg.load_balancer_log_dir / HEALTHCHECK_STATE_FILENAME
+        self._last_health_digest: str | None = None
+        self._last_health_snapshot: dict[str, Any] | None = None
+        self.valid_endpoints = self._initial_healthcheck()
+        if not self.valid_endpoints:
+            raise RuntimeError("No valid endpoints after healthcheck")
         self.client: httpx.AsyncClient | None = None
         self.message_affinity = SqliteMessageAffinityStore(
             cfg.load_balancer_affinity_db_path,
             MESSAGE_AFFINITY_CACHE_SIZE,
         )
         self.log_writer = AsyncFileLogWriter(cfg.load_balancer_log_dir, verbose=verbose)
+        self._healthcheck_task: asyncio.Task[None] | None = None
+        self._healthcheck_stop = asyncio.Event()
+
+    def _endpoint_label(self, endpoint: EndpointCheckResult) -> str:
+        return self.upstream_endpoint_labels.get(
+            (endpoint.host, endpoint.port),
+            f"{endpoint.host}:{endpoint.port}",
+        )
+
+    def _endpoint_url(self, endpoint: tuple[str, int]) -> str:
+        _, port = endpoint
+        return f"http://127.0.0.1:{port}{self.cfg.load_balancer_health_path}"
+
+    def _endpoint_probe_urls(self, endpoint: tuple[str, int]) -> list[str]:
+        _, port = endpoint
+        base = f"http://127.0.0.1:{port}"
+        paths = [self.cfg.load_balancer_health_path]
+        if self.cfg.load_balancer_health_path != "/v1/models":
+            paths.append("/v1/models")
+        return [f"{base}{path}" for path in paths]
+
+    def _models_from_payload(self, payload: Any) -> tuple[str, ...]:
+        if not isinstance(payload, dict):
+            return ()
+
+        models: list[str] = []
+        data = payload.get("data")
+        if isinstance(data, list):
+            for item in data:
+                if not isinstance(item, dict):
+                    continue
+                model_id = item.get("id")
+                if isinstance(model_id, str):
+                    models.append(model_id)
+                model_name = item.get("model")
+                if isinstance(model_name, str):
+                    models.append(model_name)
+        if models:
+            return tuple(models)
+
+        raw_models = payload.get("models")
+        if isinstance(raw_models, list):
+            for item in raw_models:
+                if isinstance(item, str):
+                    models.append(item)
+                elif isinstance(item, dict):
+                    model_id = item.get("id")
+                    if isinstance(model_id, str):
+                        models.append(model_id)
+                    model_name = item.get("model")
+                    if isinstance(model_name, str):
+                        models.append(model_name)
+        return tuple(models)
+
+    def _normalize_health_error(self, error: str) -> str:
+        if "Connection refused" in error or "All connection attempts failed" in error:
+            return "Connection refused"
+        return error
+
+    def _stateful_health_snapshot(
+        self, results: list[EndpointCheckResult]
+    ) -> tuple[dict[str, Any] | None, dict[str, Any], bool]:
+        valid_results = [result for result in results if result.error is None]
+        snapshot = {
+            "connected": len(valid_results),
+            "models": sorted({model for result in valid_results for model in result.models}),
+            "endpoints": {},
+        }
+        for result in sorted(results, key=lambda item: (item.host, item.port)):
+            label = self._endpoint_label(result)
+            if result.error is None:
+                snapshot["endpoints"][label] = {
+                    "status": "up",
+                    "models": sorted(set(result.models)),
+                }
+            else:
+                snapshot["endpoints"][label] = {
+                    "status": "down",
+                    "error": self._normalize_health_error(result.error),
+                }
+
+        serialized = json.dumps(snapshot, sort_keys=True, separators=(",", ":"))
+        digest = hashlib.sha256(serialized.encode("utf-8")).hexdigest()
+        self._health_state_path.parent.mkdir(parents=True, exist_ok=True)
+        payload = {"digest": digest, "snapshot": snapshot}
+
+        try:
+            with self._health_state_path.open("a+", encoding="utf-8") as handle:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+                handle.seek(0)
+                raw = handle.read().strip()
+                previous: dict[str, Any] = {}
+                if raw:
+                    try:
+                        parsed = json.loads(raw)
+                        if isinstance(parsed, dict):
+                            previous = parsed
+                    except json.JSONDecodeError:
+                        previous = {}
+                previous_snapshot = previous.get("snapshot")
+                if (
+                    isinstance(previous_snapshot, dict)
+                    and previous.get("digest") == digest
+                ):
+                    return previous_snapshot, snapshot, False
+
+                handle.seek(0)
+                handle.truncate()
+                handle.write(json.dumps(payload, sort_keys=True))
+                handle.flush()
+                os.fsync(handle.fileno())
+                if isinstance(previous_snapshot, dict):
+                    return previous_snapshot, snapshot, True
+                return None, snapshot, True
+        except OSError:
+            if self._last_health_digest == digest and self._last_health_snapshot is not None:
+                return self._last_health_snapshot, snapshot, False
+            previous_snapshot = self._last_health_snapshot
+            self._last_health_digest = digest
+            self._last_health_snapshot = snapshot
+            return previous_snapshot, snapshot, True
+
+    def _log_health_changes(
+        self,
+        previous_snapshot: dict[str, Any] | None,
+        current_snapshot: dict[str, Any],
+    ) -> None:
+        prev_endpoints: dict[str, Any] = {}
+        if isinstance(previous_snapshot, dict):
+            candidate = previous_snapshot.get("endpoints")
+            if isinstance(candidate, dict):
+                prev_endpoints = candidate
+
+        for label, state in current_snapshot["endpoints"].items():
+            prev_state = prev_endpoints.get(label)
+            if prev_state == state:
+                continue
+            if state["status"] == "down":
+                logger.warning("health: {} unreachable: {}", label, state["error"])
+                continue
+            models = state["models"]
+            if prev_state is None or prev_state.get("status") != "up":
+                logger.info(
+                    "health: {} reachable, models: {}",
+                    label,
+                    ", ".join(models) if models else "none",
+                )
+                continue
+            prev_models = prev_state.get("models", [])
+            if prev_models != models:
+                logger.info(
+                    "health: {} models: {}",
+                    label,
+                    ", ".join(models) if models else "none",
+                )
+
+    def _probe_models_sync(self, client: httpx.Client, endpoint: tuple[str, int]) -> tuple[tuple[str, ...], str | None]:
+        models: tuple[str, ...] = ()
+        server_error: str | None = None
+        for url in self._endpoint_probe_urls(endpoint):
+            response = client.get(url)
+            if response.status_code >= 500:
+                server_error = f"Server error '{response.status_code}' for url '{response.request.url}'"
+                continue
+            server_error = None
+            if response.status_code >= 400:
+                continue
+            try:
+                models = self._models_from_payload(response.json())
+            except (ValueError, json.JSONDecodeError):
+                models = ()
+            if models:
+                break
+        return models, server_error
+
+    async def _probe_models_async(
+        self, client: httpx.AsyncClient, endpoint: tuple[str, int]
+    ) -> tuple[tuple[str, ...], str | None]:
+        models: tuple[str, ...] = ()
+        server_error: str | None = None
+        for url in self._endpoint_probe_urls(endpoint):
+            response = await client.get(url)
+            if response.status_code >= 500:
+                server_error = f"Server error '{response.status_code}' for url '{response.request.url}'"
+                continue
+            server_error = None
+            if response.status_code >= 400:
+                continue
+            try:
+                models = self._models_from_payload(response.json())
+            except (ValueError, json.JSONDecodeError):
+                models = ()
+            if models:
+                break
+        return models, server_error
+
+    def _check_endpoint_sync(self, client: httpx.Client, endpoint: tuple[str, int]) -> EndpointCheckResult:
+        host, port = endpoint
+        try:
+            models, server_error = self._probe_models_sync(client, endpoint)
+            if server_error is not None:
+                return EndpointCheckResult(
+                    host=host,
+                    port=port,
+                    error=server_error,
+                )
+            return EndpointCheckResult(host=host, port=port, models=models)
+        except httpx.HTTPError as exc:
+            return EndpointCheckResult(host=host, port=port, error=str(exc))
+
+    async def _check_endpoint_async(
+        self,
+        client: httpx.AsyncClient,
+        endpoint: tuple[str, int],
+    ) -> EndpointCheckResult:
+        host, port = endpoint
+        try:
+            models, server_error = await self._probe_models_async(client, endpoint)
+            if server_error is not None:
+                return EndpointCheckResult(
+                    host=host,
+                    port=port,
+                    error=server_error,
+                )
+            return EndpointCheckResult(host=host, port=port, models=models)
+        except httpx.HTTPError as exc:
+            return EndpointCheckResult(host=host, port=port, error=str(exc))
+
+    def _summarize_health(self, results: list[EndpointCheckResult]) -> None:
+        previous_snapshot, current_snapshot, changed = self._stateful_health_snapshot(results)
+        if not changed:
+            return
+        logger.info(
+            "health: {} connected, models: {}",
+            current_snapshot["connected"],
+            ", ".join(current_snapshot["models"]) if current_snapshot["models"] else "none",
+        )
+        self._log_health_changes(previous_snapshot, current_snapshot)
+
+    def _initial_healthcheck(self) -> list[EndpointCheckResult]:
+        with httpx.Client(timeout=HEALTHCHECK_TIMEOUT_SECONDS) as client:
+            results = [self._check_endpoint_sync(client, endpoint) for endpoint in self.upstream_endpoints]
+        self._summarize_health(results)
+        return [result for result in results if result.error is None]
+
+    async def refresh_health(self) -> None:
+        async with httpx.AsyncClient(timeout=HEALTHCHECK_TIMEOUT_SECONDS) as client:
+            results = await asyncio.gather(
+                *(self._check_endpoint_async(client, endpoint) for endpoint in self.upstream_endpoints)
+            )
+        self.valid_endpoints = [result for result in results if result.error is None]
+        self._summarize_health(list(results))
+
+    async def _healthcheck_loop(self) -> None:
+        try:
+            while not self._healthcheck_stop.is_set():
+                await self.refresh_health()
+                try:
+                    await asyncio.wait_for(
+                        self._healthcheck_stop.wait(),
+                        timeout=HEALTHCHECK_INTERVAL_SECONDS,
+                    )
+                except asyncio.TimeoutError:
+                    continue
+        except asyncio.CancelledError:
+            return
 
     async def __call__(self, scope, receive, send) -> None:
         scope_type = scope["type"]
@@ -194,8 +504,18 @@ class LoadBalancerApp:
             if message["type"] == "lifespan.startup":
                 self.client = self._build_client()
                 self.log_writer.start()
+                self._healthcheck_stop.clear()
+                self._healthcheck_task = asyncio.create_task(self._healthcheck_loop())
                 await send({"type": "lifespan.startup.complete"})
             elif message["type"] == "lifespan.shutdown":
+                self._healthcheck_stop.set()
+                if self._healthcheck_task is not None:
+                    self._healthcheck_task.cancel()
+                    try:
+                        await self._healthcheck_task
+                    except asyncio.CancelledError:
+                        pass
+                    self._healthcheck_task = None
                 if self.client is not None:
                     await self.client.aclose()
                     self.client = None
@@ -205,20 +525,21 @@ class LoadBalancerApp:
                 return
 
     def _build_client(self) -> httpx.AsyncClient:
+        max_connections = self.cfg.load_balancer_workers * self.cfg.load_balancer_worker_concurrency
         limits = httpx.Limits(
-            max_connections=self.cfg.load_balancer_max_connections,
-            max_keepalive_connections=self.cfg.load_balancer_max_keepalive_connections,
+            max_connections=max_connections,
+            max_keepalive_connections=max_connections,
         )
         timeout = httpx.Timeout(
-            connect=self.cfg.load_balancer_upstream_timeout,
-            read=self.cfg.load_balancer_upstream_timeout,
-            write=self.cfg.load_balancer_upstream_timeout,
-            pool=self.cfg.load_balancer_upstream_timeout,
+            connect=UPSTREAM_TIMEOUT_SECONDS,
+            read=UPSTREAM_TIMEOUT_SECONDS,
+            write=UPSTREAM_TIMEOUT_SECONDS,
+            pool=UPSTREAM_TIMEOUT_SECONDS,
         )
         return httpx.AsyncClient(timeout=timeout, limits=limits)
 
     async def _handle_http(self, scope, receive, send) -> None:
-        if not self.upstream_ports:
+        if not self.valid_endpoints:
             await self._send_plain_error(send, 503, b"No upstream ports configured")
             return
 
@@ -324,7 +645,7 @@ class LoadBalancerApp:
         affinity_port = self._find_messages_affinity_port(request_body)
         if affinity_port is not None:
             return affinity_port
-        return random.choice(self.upstream_ports)
+        return random.choice([endpoint.port for endpoint in self.valid_endpoints])
 
     def _find_messages_affinity_port(self, request_body: bytes) -> int | None:
         payload = self._decode_json_value(self._decode_body_text(request_body))

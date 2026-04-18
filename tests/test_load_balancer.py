@@ -1,3 +1,4 @@
+import asyncio
 import http.client
 import json
 import socket
@@ -8,6 +9,7 @@ from contextlib import contextmanager
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
+import pytest
 import uvicorn
 
 from keep_connection import parse_config
@@ -28,6 +30,20 @@ class StubHandler(BaseHTTPRequestHandler):
 
     def do_GET(self):  # noqa: N802
         if self.path == "/models":
+            payload = json.dumps(
+                {
+                    "object": "list",
+                    "data": [{"id": f"backend-{self.server.server_port}"}],
+                }
+            ).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+            return
+
+        if self.path == "/v1/models":
             payload = json.dumps(
                 {
                     "object": "list",
@@ -185,7 +201,12 @@ def find_free_port_block(size: int) -> list[int]:
     return ports
 
 
-def write_config(config_path: Path, upstream_ports: list[int], listen_port: int):
+def write_config(
+    config_path: Path,
+    upstream_ports: list[int],
+    listen_port: int,
+    health_path: str = "/models",
+):
     config_path.write_text(
         "\n".join(
             [
@@ -197,9 +218,7 @@ def write_config(config_path: Path, upstream_ports: list[int], listen_port: int)
                 "load-balancer:",
                 "  workers: 1",
                 "  worker-concurrency: 512",
-                "  max-connections: 2048",
-                "  max-keepalive-connections: 512",
-                "  upstream-timeout: 30",
+                f"  health-path: {health_path}",
                 "",
             ]
         )
@@ -248,6 +267,109 @@ def test_curl_localhost_8001_models(tmp_path: Path):
     payload = json.loads(result.stdout)
     assert payload["object"] == "list"
     assert payload["data"][0]["id"] in {f"backend-{upstream_ports[0]}", f"backend-{upstream_ports[1]}"}
+
+
+def test_create_app_raises_when_no_valid_endpoints(monkeypatch, tmp_path: Path):
+    config_path = tmp_path / "config.yaml"
+    upstream_ports = find_free_port_block(1)
+    write_config(config_path, upstream_ports, 8001)
+    monkeypatch.setattr(load_balancer, "HEALTHCHECK_TIMEOUT_SECONDS", 0.05)
+
+    with pytest.raises(RuntimeError, match="No valid endpoints after healthcheck"):
+        load_balancer.create_app(config_path)
+
+
+def test_create_app_accepts_404_healthcheck_when_endpoint_is_reachable(tmp_path: Path):
+    config_path = tmp_path / "config.yaml"
+    upstream_ports = find_free_port_block(1)
+    write_config(config_path, upstream_ports, 8001, health_path="/does-not-exist")
+
+    with run_stub_server(upstream_ports[0]):
+        app = load_balancer.create_app(config_path)
+
+    assert [endpoint.port for endpoint in app.valid_endpoints] == upstream_ports
+
+
+def test_create_app_probes_v1_models_when_health_path_has_no_models(tmp_path: Path):
+    config_path = tmp_path / "config.yaml"
+    upstream_ports = find_free_port_block(1)
+    write_config(config_path, upstream_ports, 8001, health_path="/does-not-exist")
+
+    with run_stub_server(upstream_ports[0]):
+        app = load_balancer.create_app(config_path)
+
+    assert app.valid_endpoints[0].models == (f"backend-{upstream_ports[0]}",)
+
+
+def test_refresh_health_keeps_working_endpoints_and_warns_on_dead_ones(
+    monkeypatch, tmp_path: Path, capsys
+):
+    config_path = tmp_path / "config.yaml"
+    upstream_ports = find_free_port_block(2)
+    write_config(config_path, upstream_ports, 8001)
+    config_path.write_text(config_path.read_text() + f"  log-dir: {tmp_path / 'logs-a'}\n")
+    monkeypatch.setattr(load_balancer, "HEALTHCHECK_TIMEOUT_SECONDS", 0.05)
+
+    def start_server(port: int):
+        server = ReusableThreadingHTTPServer(("127.0.0.1", port), StubHandler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        wait_for_port(port)
+        return server, thread
+
+    server_one, thread_one = start_server(upstream_ports[0])
+    server_two, thread_two = start_server(upstream_ports[1])
+    try:
+        app = load_balancer.create_app(config_path)
+        assert [endpoint.port for endpoint in app.valid_endpoints] == upstream_ports
+
+        server_two.shutdown()
+        server_two.server_close()
+        thread_two.join(timeout=5)
+
+        asyncio.run(app.refresh_health())
+        captured = capsys.readouterr()
+
+        assert f"backend-{upstream_ports[0]}" in captured.err
+        assert f"backend-{upstream_ports[1]}" in captured.err
+        assert "health: 1 connected" in captured.err
+        assert "unreachable" in captured.err
+        assert f"worker-2:8000 (local {upstream_ports[1]}) unreachable" in captured.err
+        assert [endpoint.port for endpoint in app.valid_endpoints] == [upstream_ports[0]]
+    finally:
+        server_one.shutdown()
+        server_one.server_close()
+        thread_one.join(timeout=5)
+        try:
+            server_two.shutdown()
+            server_two.server_close()
+        except OSError:
+            pass
+        thread_two.join(timeout=5)
+
+
+def test_refresh_health_logs_only_on_information_gain(monkeypatch, tmp_path: Path, capsys):
+    config_path = tmp_path / "config.yaml"
+    upstream_ports = find_free_port_block(2)
+    write_config(config_path, upstream_ports, 8001)
+    config_path.write_text(config_path.read_text() + f"  log-dir: {tmp_path / 'logs-b'}\n")
+    monkeypatch.setattr(load_balancer, "HEALTHCHECK_TIMEOUT_SECONDS", 0.05)
+
+    server_one = ReusableThreadingHTTPServer(("127.0.0.1", upstream_ports[0]), StubHandler)
+    thread_one = threading.Thread(target=server_one.serve_forever, daemon=True)
+    thread_one.start()
+    wait_for_port(upstream_ports[0])
+    try:
+        app = load_balancer.create_app(config_path)
+        capsys.readouterr()
+
+        asyncio.run(app.refresh_health())
+        captured = capsys.readouterr()
+        assert captured.err == ""
+    finally:
+        server_one.shutdown()
+        server_one.server_close()
+        thread_one.join(timeout=5)
 
 
 def test_proxies_large_post_payload(tmp_path: Path):
@@ -501,7 +623,9 @@ def test_reuses_backend_for_matching_messages_prefix(tmp_path: Path):
     assert rows[0][3] == rows[1][3]
 
 
-def test_shares_messages_affinity_across_load_balancer_workers_via_sqlite(tmp_path: Path):
+def test_shares_messages_affinity_across_load_balancer_workers_via_sqlite(
+    tmp_path: Path, monkeypatch
+):
     config_path = tmp_path / "config.yaml"
     db_path = tmp_path / "request_logs"
     affinity_db_path = tmp_path / "affinity.sqlite3"
@@ -527,6 +651,14 @@ def test_shares_messages_affinity_across_load_balancer_workers_via_sqlite(tmp_pa
         }
     ).encode("utf-8")
 
+    monkeypatch.setattr(
+        load_balancer.LoadBalancerApp,
+        "_initial_healthcheck",
+        lambda self: [
+            load_balancer.EndpointCheckResult(host=host, port=port)
+            for host, port in self.upstream_endpoints
+        ],
+    )
     app_a = create_app(config_path)
     app_b = create_app(config_path)
     app_a._remember_messages_affinity(first_payload, upstream_ports[0])
@@ -534,7 +666,9 @@ def test_shares_messages_affinity_across_load_balancer_workers_via_sqlite(tmp_pa
     assert app_b._find_messages_affinity_port(second_payload) == upstream_ports[0]
 
 
-def test_reuses_messages_affinity_when_message_shape_changes(tmp_path: Path):
+def test_reuses_messages_affinity_when_message_shape_changes(
+    tmp_path: Path, monkeypatch
+):
     config_path = tmp_path / "config.yaml"
     db_path = tmp_path / "request_logs"
     upstream_ports = find_free_port_block(2)
@@ -567,6 +701,14 @@ def test_reuses_messages_affinity_when_message_shape_changes(tmp_path: Path):
         }
     ).encode("utf-8")
 
+    monkeypatch.setattr(
+        load_balancer.LoadBalancerApp,
+        "_initial_healthcheck",
+        lambda self: [
+            load_balancer.EndpointCheckResult(host=host, port=port)
+            for host, port in self.upstream_endpoints
+        ],
+    )
     app = create_app(config_path)
     app._remember_messages_affinity(first_payload, upstream_ports[0])
 
@@ -591,6 +733,14 @@ def test_affinity_lookup_normalizes_each_candidate_message_once(tmp_path: Path, 
         }
     ).encode("utf-8")
 
+    monkeypatch.setattr(
+        load_balancer.LoadBalancerApp,
+        "_initial_healthcheck",
+        lambda self: [
+            load_balancer.EndpointCheckResult(host=host, port=port)
+            for host, port in self.upstream_endpoints
+        ],
+    )
     app = create_app(config_path)
     app._remember_messages_affinity(
         json.dumps({"model": "demo", "messages": prefix_messages}).encode("utf-8"),
@@ -639,3 +789,37 @@ def test_serve_forever_does_not_enable_reload(monkeypatch, tmp_path: Path):
     assert seen["kwargs"]["workers"] == 1
     assert seen["kwargs"]["port"] == 8123
     assert "reload" not in seen["kwargs"]
+
+
+def test_build_client_derives_keepalive_limit_from_workers_and_concurrency(tmp_path: Path, monkeypatch):
+    config_path = tmp_path / "config.yaml"
+    upstream_ports = find_free_port_block(1)
+    write_config(config_path, upstream_ports, 8001)
+    config_path.write_text(
+        config_path.read_text()
+        + "  workers: 3\n"
+        + "  worker-concurrency: 5\n"
+    )
+
+    seen = {}
+
+    class DummyAsyncClient:
+        def __init__(self, **kwargs):
+            seen.update(kwargs)
+
+    monkeypatch.setattr(load_balancer.httpx, "AsyncClient", DummyAsyncClient)
+    monkeypatch.setattr(
+        load_balancer.LoadBalancerApp,
+        "_initial_healthcheck",
+        lambda self: [
+            load_balancer.EndpointCheckResult(host=host, port=port)
+            for host, port in self.upstream_endpoints
+        ],
+    )
+
+    app = create_app(config_path)
+    client = app._build_client()
+
+    assert isinstance(client, DummyAsyncClient)
+    assert seen["limits"].max_connections == 15
+    assert seen["limits"].max_keepalive_connections == 15

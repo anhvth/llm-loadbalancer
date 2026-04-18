@@ -27,17 +27,21 @@ port:
 load-balancer:
   workers: 20
   worker-concurrency: 512
-  max-connections: 20000
-  max-keepalive-connections: 4096
-  upstream-timeout: 300
+  health-path: /models
   log-dir: ~/.cache/llm-proxy/logs
   affinity-db: ~/.cache/llm-proxy/affinity.sqlite3
+
+port-start: 18000
 ```
 
-`log-dir` and `affinity-db` are optional. If omitted, the load balancer writes
+`health-path`, `log-dir`, and `affinity-db` are optional. If omitted, the load balancer probes
+`/models`, writes
 request log files to `~/.cache/llm-proxy/logs` and stores shared message-affinity
-state in `~/.cache/llm-proxy/affinity.sqlite3`. Local SSH tunnel ports are chosen
-automatically from a free high port range, so you do not need `port-start`.
+state in `~/.cache/llm-proxy/affinity.sqlite3`. Local SSH tunnel ports default
+to the fixed range starting at `18000`, so you only need `port-start` if you
+want a different range.
+`max-connections` and `max-keepalive-connections` are derived automatically as
+`workers * worker-concurrency`.
 
 ### Commands
 

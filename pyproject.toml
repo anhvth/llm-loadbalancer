@@ -6,6 +6,7 @@ readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
     "httpx>=0.28.1",
+    "loguru>=0.7.3",
     "pytest>=9.0.3",
     "uvicorn>=0.44.0",
 ]
