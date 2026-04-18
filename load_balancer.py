@@ -40,6 +40,8 @@ HOP_BY_HOP_HEADERS = {
 
 MESSAGE_AFFINITY_CACHE_SIZE = 4096
 MESSAGE_AFFINITY_IGNORED_KEYS = {"cache_control", "role", "signature", "type"}
+MESSAGE_AFFINITY_INIT_LOCK_RETRY_TIMEOUT_SECONDS = 30.0
+MESSAGE_AFFINITY_INIT_LOCK_RETRY_DELAY_SECONDS = 0.1
 REQUEST_LOGS_DIRNAME = "requests"
 UPSTREAM_TIMEOUT_SECONDS = 300.0
 HEALTHCHECK_TIMEOUT_SECONDS = 2.0
@@ -140,18 +142,31 @@ class SqliteMessageAffinityStore:
             isolation_level=None,
             check_same_thread=False,
         )
-        with self._lock:
-            self.connection.execute("PRAGMA journal_mode=WAL")
-            self.connection.execute("PRAGMA synchronous=NORMAL")
-            self.connection.execute(
-                """
-                CREATE TABLE IF NOT EXISTS message_affinity (
-                    prefix_key TEXT PRIMARY KEY,
-                    upstream_port INTEGER NOT NULL,
-                    last_access_ns INTEGER NOT NULL
-                )
-                """
-            )
+        self._initialize_schema_with_retry()
+
+    def _initialize_schema_with_retry(self) -> None:
+        deadline = time.monotonic() + MESSAGE_AFFINITY_INIT_LOCK_RETRY_TIMEOUT_SECONDS
+        while True:
+            try:
+                with self._lock:
+                    self.connection.execute("PRAGMA journal_mode=WAL")
+                    self.connection.execute("PRAGMA synchronous=NORMAL")
+                    self.connection.execute(
+                        """
+                        CREATE TABLE IF NOT EXISTS message_affinity (
+                            prefix_key TEXT PRIMARY KEY,
+                            upstream_port INTEGER NOT NULL,
+                            last_access_ns INTEGER NOT NULL
+                        )
+                        """
+                    )
+                return
+            except sqlite3.OperationalError as exc:
+                if "database is locked" not in str(exc).lower():
+                    raise
+                if time.monotonic() >= deadline:
+                    raise
+                time.sleep(MESSAGE_AFFINITY_INIT_LOCK_RETRY_DELAY_SECONDS)
 
     def close(self) -> None:
         with self._lock:

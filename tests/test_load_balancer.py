@@ -2,6 +2,7 @@ import asyncio
 import http.client
 import json
 import socket
+import sqlite3
 import subprocess
 import threading
 import time
@@ -856,6 +857,32 @@ def test_affinity_lookup_normalizes_each_candidate_message_once(tmp_path: Path, 
 
     assert app._find_messages_affinity_port(lookup_payload) == upstream_ports[0]
     assert call_count == 1
+
+
+def test_sqlite_affinity_store_retries_transient_init_lock(tmp_path: Path, monkeypatch):
+    class FakeConnection:
+        def __init__(self):
+            self.queries: list[str] = []
+            self._locked_once = False
+
+        def execute(self, query, *args, **kwargs):
+            self.queries.append(query)
+            if query == "PRAGMA journal_mode=WAL" and not self._locked_once:
+                self._locked_once = True
+                raise sqlite3.OperationalError("database is locked")
+            return self
+
+        def close(self):
+            return None
+
+    fake_connection = FakeConnection()
+    monkeypatch.setattr(load_balancer.sqlite3, "connect", lambda *args, **kwargs: fake_connection)
+
+    store = load_balancer.SqliteMessageAffinityStore(tmp_path / "affinity.sqlite3", max_entries=16)
+
+    assert fake_connection.queries.count("PRAGMA journal_mode=WAL") == 2
+    assert any("CREATE TABLE IF NOT EXISTS message_affinity" in query for query in fake_connection.queries)
+    store.close()
 
 
 def test_parse_config_resolves_default_db_path_relative_to_config(tmp_path: Path):
