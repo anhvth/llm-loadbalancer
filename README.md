@@ -1,7 +1,8 @@
 # llm-loadbalancer
 
-`llm-loadbalancer` keeps a pool of SSH port-forward tunnels alive and proxies
-OpenAI-like HTTP traffic to a random local upstream.
+`llm-loadbalancer` can either keep a pool of SSH port-forward tunnels alive or
+connect directly to reachable workers, then proxy OpenAI-like HTTP traffic to a
+random upstream.
 
 ## Quick Start
 
@@ -20,26 +21,28 @@ Example [`example_config.yaml`](/Users/anhvth/projects/llm-loadbalancer/example_
 ```yaml
 endpoints:
   - worker-[41,45,49,53-54,57,59]:8000
+  - setup: "ssh"
 
 port:
   - 8001
 
 load-balancer:
-  workers: 20
-  worker-concurrency: 512
+  workers: 4
+  worker-concurrency: 10204
   health-path: /models
   log-dir: ~/.cache/llm-proxy/logs
   affinity-db: ~/.cache/llm-proxy/affinity.sqlite3
 
-port-start: 18000
+port-start: 18001
 ```
 
-`health-path`, `log-dir`, and `affinity-db` are optional. If omitted, the load balancer probes
-`/models`, writes
-request log files to `~/.cache/llm-proxy/logs` and stores shared message-affinity
-state in `~/.cache/llm-proxy/affinity.sqlite3`. Local SSH tunnel ports default
-to the fixed range starting at `18000`, so you only need `port-start` if you
-want a different range.
+`endpoints.setup` defaults to `ssh`. Use `setup: "direct"` when the load
+balancer can already reach the worker hosts without SSH tunneling. `health-path`,
+`log-dir`, and `affinity-db` are optional. If omitted, the load balancer probes
+`/models`, writes request log files to `~/.cache/llm-proxy/logs` and stores
+shared message-affinity state in `~/.cache/llm-proxy/affinity.sqlite3`. Local
+SSH tunnel ports default to the fixed range starting at `18000`, so you only
+need `port-start` if you want a different range.
 Per-worker upstream connection limits are derived automatically from
 `worker-concurrency` and the process file descriptor limit.
 

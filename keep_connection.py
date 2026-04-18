@@ -5,6 +5,7 @@ The current config format is intentionally simple:
 
 endpoints:
   - worker-[41,45,49,53-54,57,59]:8000
+  - setup: ssh
 
 Optional keys:
   - remote-port: 8000
@@ -46,6 +47,7 @@ class TunnelConfig:
     port_start: int
     remote_ports: list[int] = dataclasses.field(default_factory=list)
     remote_port: int = 8000
+    endpoint_setup: str = "ssh"
     listen_port: int = 8001
     load_balancer_workers: int = 20
     load_balancer_worker_concurrency: int = 512
@@ -99,6 +101,13 @@ def resolve_config_relative_path(config_path: pathlib.Path, raw_path: str) -> pa
     return config_path.parent / candidate
 
 
+def _strip_wrapping_quotes(value: str) -> str:
+    value = value.strip()
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
+        return value[1:-1]
+    return value
+
+
 def _expand_endpoint_hosts(raw_host: str) -> list[str]:
     if raw_host.startswith("[") and raw_host.endswith("]"):
         return [
@@ -139,7 +148,7 @@ def parse_config(path: pathlib.Path) -> TunnelConfig:
         if match and section == "endpoints":
             key = match.group(1)
             value = match.group(2).strip()
-            if key in {"hosts", "port-start", "remote-port"}:
+            if key in {"hosts", "port-start", "remote-port", "setup"}:
                 endpoint_items.append((key, value))
             else:
                 endpoint_entries.extend(_parse_endpoint_entry(f"{key}:{value}", 8000))
@@ -163,15 +172,18 @@ def parse_config(path: pathlib.Path) -> TunnelConfig:
             endpoint_items.append(("hosts", entry))
             continue
 
-        match = re.fullmatch(r"\s*([A-Za-z0-9_.-]+):\s*(.+)", line)
+        match = re.fullmatch(r"(\s*)([A-Za-z0-9_.-]+):\s*(.+)", line)
         if match:
-            if section == "tmux":
+            indentation, key, value = match.groups()
+            if not indentation:
+                target = root
+            elif section == "tmux":
                 target = tmux
             elif section == "load-balancer":
                 target = load_balancer
             else:
                 target = root
-            target[match.group(1)] = match.group(2).strip()
+            target[key] = value.strip()
             continue
 
         raise ValueError(f"Cannot parse line: {raw_line!r}")
@@ -183,6 +195,9 @@ def parse_config(path: pathlib.Path) -> TunnelConfig:
     merged.update(root)
 
     remote_port = int(merged.get("remote-port", "8000"))
+    endpoint_setup = _strip_wrapping_quotes(merged.get("setup", "ssh")).lower()
+    if endpoint_setup not in {"ssh", "direct"}:
+        raise ValueError(f"Unsupported endpoints.setup value: {endpoint_setup!r}")
     hosts_raw = merged.get("hosts")
     if endpoint_entries:
         hosts = [host for host, _ in endpoint_entries]
@@ -222,6 +237,7 @@ def parse_config(path: pathlib.Path) -> TunnelConfig:
         port_start=port_start,
         remote_ports=remote_ports,
         remote_port=remote_port,
+        endpoint_setup=endpoint_setup,
         listen_port=listen_port,
         load_balancer_workers=load_balancer_workers,
         load_balancer_worker_concurrency=load_balancer_worker_concurrency,
@@ -248,7 +264,13 @@ def build_command(host: str, local_port: int, remote_port: int, cfg: TunnelConfi
     ]
 
 
+def uses_ssh_tunnels(cfg: TunnelConfig) -> bool:
+    return cfg.endpoint_setup == "ssh"
+
+
 def iter_commands(cfg: TunnelConfig) -> Iterable[list[str]]:
+    if not uses_ssh_tunnels(cfg):
+        return
     remote_ports = cfg.remote_ports or [cfg.remote_port] * len(cfg.hosts)
     for index, (host, remote_port) in enumerate(zip(cfg.hosts, remote_ports)):
         yield build_command(host, cfg.port_start + index, remote_port, cfg)
@@ -345,6 +367,10 @@ def main(argv: list[str]) -> int:
         logger.info(shlex.join(cmd))
 
     if args.print_only:
+        return 0
+
+    if not uses_ssh_tunnels(cfg):
+        logger.info("Using direct upstream connections; no SSH tunnels started")
         return 0
 
     try:

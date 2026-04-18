@@ -125,8 +125,22 @@ def test_start_everything_launches_tmux_before_load_balancer(monkeypatch, tmp_pa
     assert call_order[1] == ("serve", config_path, False)
     assert call_order[0][1] == "keepssh"
     assert len(call_order[0][2]) == 7
-    assert call_order[0][2][0][5] == "18000:localhost:8000"
-    assert call_order[0][2][1][5] == "18001:localhost:8000"
+    assert call_order[0][2][0][5] == "18001:localhost:8000"
+    assert call_order[0][2][1][5] == "18002:localhost:8000"
+
+
+def test_start_everything_skips_tmux_for_direct_setup(monkeypatch, tmp_path):
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(main.DEFAULT_CONFIG.replace('- setup: "ssh"', '- setup: "direct"'))
+    seen = []
+
+    monkeypatch.setattr(main, "launch_in_tmux", lambda *args, **kwargs: seen.append("tmux"))
+    monkeypatch.setattr(main, "serve_forever", lambda path, verbose=False: seen.append((path, verbose)))
+
+    result = main.start_everything(config_path)
+
+    assert result == 0
+    assert seen == [(config_path, False)]
 
 
 def test_start_everything_logs_config_path_and_table(monkeypatch, tmp_path):
@@ -180,8 +194,31 @@ def test_parse_config_supports_compact_endpoint_port_rows(monkeypatch, tmp_path)
         "worker-59",
     ]
     assert cfg.remote_ports == [8000] * 7
+    assert cfg.endpoint_setup == "ssh"
     assert cfg.port_start == 18000
     assert cfg.load_balancer_health_path == "/models"
+
+
+def test_parse_config_supports_direct_endpoint_setup(tmp_path):
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        "\n".join(
+            [
+                "endpoints:",
+                "  - worker-[41,45]:8000",
+                '  - setup: "direct"',
+                "port:",
+                "  - 8001",
+                "",
+            ]
+        )
+    )
+
+    cfg = keep_connection.parse_config(config_path)
+
+    assert cfg.hosts == ["worker-41", "worker-45"]
+    assert cfg.remote_ports == [8000, 8000]
+    assert cfg.endpoint_setup == "direct"
 
 
 def test_main_returns_130_on_keyboard_interrupt(monkeypatch, tmp_path):

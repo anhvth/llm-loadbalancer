@@ -272,14 +272,89 @@ def test_curl_localhost_8001_models(tmp_path: Path):
     assert payload["data"][0]["id"] in {f"backend-{upstream_ports[0]}", f"backend-{upstream_ports[1]}"}
 
 
+def test_direct_setup_proxies_to_reachable_worker_hosts(tmp_path: Path):
+    config_path = tmp_path / "config.yaml"
+    db_path = tmp_path / "request_logs"
+    upstream_ports = find_free_port_block(2)
+    config_path.write_text(
+        "\n".join(
+            [
+                "endpoints:",
+                f"  - 127.0.0.1:{upstream_ports[0]}",
+                f"  - 127.0.0.1:{upstream_ports[1]}",
+                '  - setup: "direct"',
+                "port:",
+                "  - 8001",
+                "load-balancer:",
+                "  workers: 1",
+                "  worker-concurrency: 512",
+                "  health-path: /models",
+                f"  log-dir: {db_path}",
+                "port-start: 18001",
+                "",
+            ]
+        )
+    )
+
+    request_payload = {"model": "demo", "messages": [{"role": "user", "content": "hi"}]}
+
+    with run_stub_server(upstream_ports[0]), run_stub_server(upstream_ports[1]), run_load_balancer(
+        config_path
+    ) as listen_port:
+        conn = http.client.HTTPConnection("127.0.0.1", listen_port, timeout=30)
+        conn.request(
+            "POST",
+            "/v1/chat/completions",
+            body=json.dumps(request_payload),
+            headers={"Content-Type": "application/json"},
+        )
+        response = conn.getresponse()
+        body = response.read().decode("utf-8")
+        conn.close()
+
+    assert response.status == 200
+    assert json.loads(body)["received_bytes"] > 0
+    rows = read_log_rows(db_path)
+    assert len(rows) == 1
+    assert rows[0][3] in {f"http://127.0.0.1:{port}/v1/chat/completions" for port in upstream_ports}
+
+
 def test_create_app_raises_when_no_valid_endpoints(monkeypatch, tmp_path: Path):
     config_path = tmp_path / "config.yaml"
     upstream_ports = find_free_port_block(1)
     write_config(config_path, upstream_ports, 8001)
     monkeypatch.setattr(load_balancer, "HEALTHCHECK_TIMEOUT_SECONDS", 0.05)
+    monkeypatch.setattr(load_balancer, "INITIAL_HEALTHCHECK_TIMEOUT_SECONDS", 0.0)
 
     with pytest.raises(RuntimeError, match="No valid endpoints after healthcheck"):
         load_balancer.create_app(config_path)
+
+
+def test_create_app_waits_for_delayed_initial_endpoint(monkeypatch, tmp_path: Path):
+    config_path = tmp_path / "config.yaml"
+    upstream_ports = find_free_port_block(1)
+    write_config(config_path, upstream_ports, 8001)
+    monkeypatch.setattr(load_balancer, "HEALTHCHECK_TIMEOUT_SECONDS", 0.05)
+    monkeypatch.setattr(load_balancer, "INITIAL_HEALTHCHECK_TIMEOUT_SECONDS", 1.0)
+    monkeypatch.setattr(load_balancer, "INITIAL_HEALTHCHECK_RETRY_DELAY_SECONDS", 0.01)
+
+    started = threading.Event()
+
+    def start_server_later():
+        time.sleep(0.1)
+        with run_stub_server(upstream_ports[0]):
+            started.set()
+            time.sleep(0.3)
+
+    thread = threading.Thread(target=start_server_later, daemon=True)
+    thread.start()
+
+    try:
+        app = load_balancer.create_app(config_path)
+        assert [endpoint.port for endpoint in app.valid_endpoints] == upstream_ports
+        assert started.is_set()
+    finally:
+        thread.join(timeout=5)
 
 
 def test_create_app_accepts_404_healthcheck_when_endpoint_is_reachable(tmp_path: Path):
@@ -1070,6 +1145,20 @@ def test_parse_config_resolves_default_db_path_relative_to_config(tmp_path: Path
     assert cfg.load_balancer_affinity_db_path == Path("~/.cache/llm-proxy/affinity.sqlite3").expanduser()
 
 
+def test_listen_backlog_scales_with_total_concurrency(tmp_path: Path):
+    config_path = tmp_path / "config.yaml"
+    upstream_ports = find_free_port_block(1)
+    write_config(config_path, upstream_ports, 8001)
+    config_path.write_text(
+        config_path.read_text()
+        + "  workers: 4\n"
+        + "  worker-concurrency: 10204\n"
+    )
+    cfg = parse_config(config_path)
+
+    assert load_balancer.listen_backlog_for_worker_concurrency(cfg, 10204) == 40816
+
+
 def test_serve_forever_does_not_enable_reload(monkeypatch, tmp_path: Path):
     config_path = tmp_path / "config.yaml"
     upstream_ports = find_free_port_block(1)
@@ -1098,6 +1187,7 @@ def test_serve_forever_does_not_enable_reload(monkeypatch, tmp_path: Path):
     assert seen["kwargs"]["workers"] == 1
     assert seen["kwargs"]["port"] == 8123
     assert seen["kwargs"]["limit_concurrency"] == 123
+    assert seen["kwargs"]["backlog"] == 4096
     assert "reload" not in seen["kwargs"]
     assert os.environ[load_balancer.LLM_PROXY_EFFECTIVE_WORKER_CONCURRENCY_ENV] == "123"
 

@@ -53,12 +53,16 @@ HEALTHCHECK_TIMEOUT_SECONDS = 2.0
 HEALTHCHECK_INTERVAL_SECONDS = 30.0
 HEALTHCHECK_CONNECT_RETRIES = 3
 HEALTHCHECK_CONNECT_RETRY_DELAY_SECONDS = 0.2
+INITIAL_HEALTHCHECK_TIMEOUT_SECONDS = 15.0
+INITIAL_HEALTHCHECK_RETRY_DELAY_SECONDS = 0.25
 HEALTHCHECK_STATE_FILENAME = "health_state.json"
 REQUEST_RESPONSE_LOG_MIN_INTERVAL_SECONDS = 2.0
 FD_BASE_OVERHEAD = 128
 FD_PER_CONCURRENT_REQUEST = 2
 FD_PER_ENDPOINT_HEALTHCHECK = 1
 FD_FALLBACK_SOFT_LIMIT = 1024
+MIN_LISTEN_BACKLOG = 4096
+MAX_LISTEN_BACKLOG = 65535
 LLM_PROXY_EFFECTIVE_WORKER_CONCURRENCY_ENV = "LLM_PROXY_EFFECTIVE_WORKER_CONCURRENCY"
 
 logger.remove()
@@ -193,6 +197,11 @@ def resolve_effective_worker_concurrency(cfg: TunnelConfig) -> int:
         return max(1, int(raw_value))
     except ValueError:
         return max(1, cfg.load_balancer_worker_concurrency)
+
+
+def listen_backlog_for_worker_concurrency(cfg: TunnelConfig, worker_concurrency: int) -> int:
+    desired_backlog = max(1, cfg.load_balancer_workers) * max(1, worker_concurrency)
+    return max(MIN_LISTEN_BACKLOG, min(MAX_LISTEN_BACKLOG, desired_backlog))
 
 
 class AsyncFileLogWriter:
@@ -342,13 +351,27 @@ def build_upstream_endpoints(cfg: TunnelConfig) -> list[tuple[str, int]]:
     return [(host, cfg.port_start + index) for index, host in enumerate(cfg.hosts)]
 
 
+def build_upstream_targets(cfg: TunnelConfig) -> dict[int, tuple[str, int]]:
+    remote_ports = cfg.remote_ports or [cfg.remote_port] * len(cfg.hosts)
+    targets: dict[int, tuple[str, int]] = {}
+    for index, (host, remote_port) in enumerate(zip(cfg.hosts, remote_ports)):
+        endpoint_port = cfg.port_start + index
+        if cfg.endpoint_setup == "direct":
+            targets[endpoint_port] = (host, remote_port)
+        else:
+            targets[endpoint_port] = ("127.0.0.1", endpoint_port)
+    return targets
+
+
 def build_upstream_endpoint_labels(cfg: TunnelConfig) -> dict[tuple[str, int], str]:
     remote_ports = cfg.remote_ports or [cfg.remote_port] * len(cfg.hosts)
     labels: dict[tuple[str, int], str] = {}
     for index, (host, remote_port) in enumerate(zip(cfg.hosts, remote_ports)):
         local_port = cfg.port_start + index
         key = (host, local_port)
-        if local_port == remote_port:
+        if cfg.endpoint_setup == "direct":
+            labels[key] = f"{host}:{remote_port}"
+        elif local_port == remote_port:
             labels[key] = f"{host}:{local_port}"
         else:
             labels[key] = f"{host}:{remote_port} (local {local_port})"
@@ -361,6 +384,7 @@ class LoadBalancerApp:
         self.verbose = verbose
         self.effective_worker_concurrency = resolve_effective_worker_concurrency(cfg)
         self.upstream_endpoints = build_upstream_endpoints(cfg)
+        self._upstream_targets = build_upstream_targets(cfg)
         self.upstream_endpoint_labels = build_upstream_endpoint_labels(cfg)
         self.endpoint_request_counts: dict[str, int] = {
             label: 0 for label in self.upstream_endpoint_labels.values()
@@ -371,9 +395,7 @@ class LoadBalancerApp:
         self._health_state_path = self.cfg.load_balancer_log_dir / HEALTHCHECK_STATE_FILENAME
         self._last_health_digest: str | None = None
         self._last_health_snapshot: dict[str, Any] | None = None
-        self.valid_endpoints = self._initial_healthcheck()
-        if not self.valid_endpoints:
-            raise RuntimeError("No valid endpoints after healthcheck")
+        self.valid_endpoints = self._wait_for_initial_endpoints()
         self.client: httpx.AsyncClient | None = None
         self.message_affinity = SqliteMessageAffinityStore(
             cfg.load_balancer_affinity_db_path,
@@ -391,11 +413,13 @@ class LoadBalancerApp:
 
     def _endpoint_url(self, endpoint: tuple[str, int]) -> str:
         _, port = endpoint
-        return f"http://127.0.0.1:{port}{self.cfg.load_balancer_health_path}"
+        target_host, target_port = self._upstream_targets.get(port, ("127.0.0.1", port))
+        return f"http://{target_host}:{target_port}{self.cfg.load_balancer_health_path}"
 
     def _endpoint_probe_urls(self, endpoint: tuple[str, int]) -> list[str]:
         _, port = endpoint
-        base = f"http://127.0.0.1:{port}"
+        target_host, target_port = self._upstream_targets.get(port, ("127.0.0.1", port))
+        base = f"http://{target_host}:{target_port}"
         paths = [self.cfg.load_balancer_health_path]
         if self.cfg.load_balancer_health_path != "/v1/models":
             paths.append("/v1/models")
@@ -625,6 +649,17 @@ class LoadBalancerApp:
         self._summarize_health(results)
         return [result for result in results if result.error is None]
 
+    def _wait_for_initial_endpoints(self) -> list[EndpointCheckResult]:
+        deadline = time.monotonic() + max(0.0, INITIAL_HEALTHCHECK_TIMEOUT_SECONDS)
+        while True:
+            valid_results = self._initial_healthcheck()
+            if valid_results:
+                return valid_results
+            if time.monotonic() >= deadline:
+                break
+            time.sleep(max(0.0, INITIAL_HEALTHCHECK_RETRY_DELAY_SECONDS))
+        raise RuntimeError("No valid endpoints after healthcheck")
+
     async def refresh_health(self) -> None:
         async with httpx.AsyncClient(timeout=HEALTHCHECK_TIMEOUT_SECONDS) as client:
             results = await asyncio.gather(
@@ -726,7 +761,11 @@ class LoadBalancerApp:
 
         request_body = bytes(request_chunks)
         upstream_port, route_reason = self._choose_upstream_port(request_body, valid_endpoints)
-        upstream_url = f"http://127.0.0.1:{upstream_port}{path}"
+        upstream_host, upstream_target_port = self._upstream_targets.get(
+            upstream_port,
+            ("127.0.0.1", upstream_port),
+        )
+        upstream_url = f"http://{upstream_host}:{upstream_target_port}{path}"
         headers = self._build_upstream_headers(scope["headers"], upstream_port)
         request = client.build_request(method, upstream_url, headers=headers, content=request_body)
 
@@ -736,7 +775,10 @@ class LoadBalancerApp:
             await self._send_plain_error(send, 502, f"Upstream request failed: {exc}".encode("utf-8"))
             return
 
-        endpoint_label = self._endpoint_label_by_port.get(upstream_port, f"127.0.0.1:{upstream_port}")
+        endpoint_label = self._endpoint_label_by_port.get(
+            upstream_port,
+            f"{upstream_host}:{upstream_target_port}",
+        )
         self.endpoint_request_counts[endpoint_label] = (
             self.endpoint_request_counts.get(endpoint_label, 0) + 1
         )
@@ -782,7 +824,8 @@ class LoadBalancerApp:
             if key in HOP_BY_HOP_HEADERS or key == b"host":
                 continue
             forwarded_headers.append((raw_key.decode("latin1"), raw_value.decode("latin1")))
-        forwarded_headers.append(("host", f"127.0.0.1:{upstream_port}"))
+        target_host, target_port = self._upstream_targets.get(upstream_port, ("127.0.0.1", upstream_port))
+        forwarded_headers.append(("host", f"{target_host}:{target_port}"))
         return forwarded_headers
 
     async def _send_plain_error(self, send, status: int, body: bytes) -> None:
@@ -1115,7 +1158,10 @@ def serve_forever(
         port=cfg.listen_port,
         workers=cfg.load_balancer_workers,
         limit_concurrency=fd_plan.effective_worker_concurrency,
-        backlog=4096,
+        backlog=listen_backlog_for_worker_concurrency(
+            cfg,
+            fd_plan.effective_worker_concurrency,
+        ),
         timeout_keep_alive=30,
         access_log=False,
         log_level="info",

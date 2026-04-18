@@ -8,7 +8,7 @@ import sys
 
 from loguru import logger
 
-from keep_connection import iter_commands, launch_in_tmux, parse_config
+from keep_connection import iter_commands, launch_in_tmux, parse_config, uses_ssh_tunnels
 from load_balancer import serve_forever
 
 logger.remove()
@@ -20,21 +20,22 @@ def _log_sink(message):
 
 logger.add(_log_sink, format="{message}", level="INFO")
 
-DEFAULT_CONFIG = """# Replace the worker host entries with your actual SSH targets.
+DEFAULT_CONFIG = """# Replace the worker host entries with your actual upstreams.
 endpoints:
   - worker-[41,45,49,53-54,57,59]:8000
+  - setup: "ssh"
 
 port:
   - 8001
 
 load-balancer:
-  workers: 20
-  worker-concurrency: 512
+  workers: 4
+  worker-concurrency: 10204
   health-path: /models
   log-dir: ~/.cache/llm-proxy/logs
   affinity-db: ~/.cache/llm-proxy/affinity.sqlite3
 
-port-start: 18000
+port-start: 18001
 """
 
 
@@ -77,6 +78,7 @@ def format_config_table(config_path: pathlib.Path, cfg) -> str:
     rows = [
         ("config-path", str(config_path)),
         ("endpoints", ", ".join(endpoint_rows) if endpoint_rows else "-"),
+        ("endpoint-setup", cfg.endpoint_setup),
         ("listen-port", str(cfg.listen_port)),
         ("port-start", str(cfg.port_start)),
         ("tmux-session", cfg.tmux_session_name),
@@ -108,15 +110,18 @@ def start_everything(config_path: pathlib.Path, verbose: bool = False) -> int:
     logger.info("Using config file: {}", config_path)
     logger.info("Loaded config:\n{}", format_config_table(config_path, cfg))
     commands = list(iter_commands(cfg))
-    launch_in_tmux(cfg.tmux_session_name, commands)
-    logger.info("Started SSH tunnels in tmux session: {}", cfg.tmux_session_name)
+    if uses_ssh_tunnels(cfg):
+        launch_in_tmux(cfg.tmux_session_name, commands)
+        logger.info("Started SSH tunnels in tmux session: {}", cfg.tmux_session_name)
+    else:
+        logger.info("Using direct upstream connections; skipping SSH tunnel startup")
     serve_forever(config_path, verbose=verbose)
     return 0
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Start the SSH tunnel pool and the load balancer"
+        description="Start the upstream pool and the load balancer"
     )
     parser.add_argument(
         "--config",
