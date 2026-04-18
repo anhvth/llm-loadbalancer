@@ -3,6 +3,18 @@
 `llm-loadbalancer` keeps a pool of SSH port-forward tunnels alive and proxies
 OpenAI-like HTTP traffic to a random local upstream.
 
+## Quick Start
+
+```bash
+uvx --from llm-loadbalancer llmproxy
+```
+
+Or with `uv run` inside a clone of this repo:
+
+```bash
+uv run llmproxy
+```
+
 ## Config
 
 Example `config.yaml`:
@@ -30,6 +42,14 @@ load-balancer:
 `db-path` is optional. If omitted, the load balancer writes to
 `llm_loadbalancer.sqlite3` in the same directory as the config file.
 
+### Commands
+
+- `uv run llmproxy` — start the load balancer (creates a default `config.yaml` if one does not exist)
+- `uv run llmproxy --set-config` — open the config file in your editor
+- `uv run llmproxy --verbose` — print each logged request/response row to stderr
+- `uv run cat_db` — inspect the SQLite log in an interactive terminal
+- `uv run cat_db --raw` — print one JSON object per line (for scripting)
+
 ## Request Logging
 
 Completed JSON request/response pairs are stored in a local SQLite table named
@@ -56,5 +76,5 @@ uv run cat_db --raw
 Without an argument, `cat_db` reads `./llm_loadbalancer.sqlite3`.
 
 - Default mode formats one row at a time and, in an interactive terminal, lets
-  you move with `Enter`, arrow keys, `j`/`k`, and quit with `q`.
+  you move with `Enter`, arrow keys, `j`/`k`, `gg`/`G`, and quit with `q`.
 - Use `--raw` to print one JSON object per line for scripts or piping.

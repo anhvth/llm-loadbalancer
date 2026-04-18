@@ -12,7 +12,7 @@ dependencies = [
 
 [project.scripts]
 cat_db = "cat_db:main"
-llmup = "main:main"
+llmproxy = "main:main"
 
 [build-system]
 requires = ["hatchling"]
