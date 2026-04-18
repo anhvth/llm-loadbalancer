@@ -27,7 +27,8 @@ load-balancer:
   max-connections: 20000
   max-keepalive-connections: 4096
   upstream-timeout: 300
-  db-path: llm_loadbalancer.sqlite3
+  log-dir: ~/.cache/llmup/logs
+  affinity-db: ~/.cache/llmup/affinity.sqlite3
 """
 
 
@@ -87,9 +88,9 @@ def build_parser() -> argparse.ArgumentParser:
         help="Open the config file in your editor and exit",
     )
     parser.add_argument(
-        "--verbose",
+        "--silent",
         action="store_true",
-        help="Print each JSON request/response row when it is inserted into the local DB",
+        help="Suppress printing JSON request/response files to the local cache directory",
     )
     return parser
 
@@ -102,7 +103,7 @@ def main(argv: list[str] | None = None) -> int:
         return open_config_in_editor(args.config)
 
     try:
-        return start_everything(args.config, verbose=args.verbose)
+        return start_everything(args.config, verbose=not args.silent)
     except KeyboardInterrupt:
         return 130
 

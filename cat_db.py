@@ -1,11 +1,10 @@
 from __future__ import annotations
 
 import argparse
-import json
 import fcntl
+import json
 import os
 import pathlib
-import sqlite3
 import sys
 import textwrap
 
@@ -17,12 +16,26 @@ except ImportError:  # pragma: no cover - not expected on Unix-like systems used
     tty = None
 
 
-DEFAULT_DB_PATH = pathlib.Path("llm_loadbalancer.sqlite3")
+REQUEST_LOGS_DIRNAME = "requests"
+
+
+def default_log_dir() -> pathlib.Path:
+    config_path = pathlib.Path("config.yaml")
+    if config_path.exists():
+        try:
+            for line in config_path.read_text().splitlines():
+                if line.startswith("log-dir:"):
+                    log_dir = line.split("log-dir:", 1)[1].strip()
+                    if log_dir:
+                        return pathlib.Path(log_dir).expanduser()
+        except Exception:
+            pass
+    return pathlib.Path("~/.cache/llmup/logs").expanduser()
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Print request_response_log rows as pretty JSON by default"
+        description="Print request log files as pretty JSON by default"
     )
     parser.add_argument(
         "--raw",
@@ -30,23 +43,24 @@ def build_parser() -> argparse.ArgumentParser:
         help="Print each row on a single line instead of pretty-printed JSON",
     )
     parser.add_argument(
-        "db_path",
+        "log_dir",
         nargs="?",
         type=pathlib.Path,
-        default=DEFAULT_DB_PATH,
-        help="Path to the SQLite database. Defaults to ./llm_loadbalancer.sqlite3",
+        default=default_log_dir(),
+        help="Path to the request log directory. Defaults to ~/.cache/llmup/logs",
     )
     return parser
 
 
-def iter_rows(db_path: pathlib.Path):
-    with sqlite3.connect(db_path) as connection:
-        yield from connection.execute(
-            """
-            SELECT id, input, output, endpoint_used
-            FROM request_response_log
-            ORDER BY id
-            """
+def iter_rows(log_dir: pathlib.Path):
+    requests_dir = log_dir / REQUEST_LOGS_DIRNAME
+    for index, path in enumerate(sorted(requests_dir.glob("*.json")), start=1):
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        yield (
+            index,
+            str(payload.get("input", "")),
+            str(payload.get("output", "")),
+            str(payload.get("endpoint_used", "")),
         )
 
 
@@ -142,9 +156,9 @@ def supports_interactive_navigation() -> bool:
 
 def read_key() -> str:
     file_descriptor = sys.stdin.fileno()
-    old_settings = termios.tcgetattr(file_descriptor)
+    old_settings = termios.tcgetattr(file_descriptor)  # pyright: ignore[reportOptionalMemberAccess]
     try:
-        tty.setraw(file_descriptor)
+        tty.setraw(file_descriptor)  # pyright: ignore[reportOptionalMemberAccess]
         first = sys.stdin.read(1)
         if first == "G":
             return "end"
@@ -172,7 +186,7 @@ def read_key() -> str:
             return "end"
         return first + second + third
     finally:
-        termios.tcsetattr(file_descriptor, termios.TCSADRAIN, old_settings)
+        termios.tcsetattr(file_descriptor, termios.TCSADRAIN, old_settings)  # pyright: ignore[reportOptionalMemberAccess]
 
 
 def browse_rows(rows: list[tuple[int, str, str, str]]) -> int:
@@ -203,9 +217,9 @@ def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
 
     try:
-        rows = list(iter_rows(args.db_path))
-    except sqlite3.Error as exc:
-        print(f"Failed to read {args.db_path}: {exc}", file=sys.stderr)
+        rows = list(iter_rows(args.log_dir))
+    except (OSError, json.JSONDecodeError) as exc:
+        print(f"Failed to read {args.log_dir}: {exc}", file=sys.stderr)
         return 1
 
     if args.raw:

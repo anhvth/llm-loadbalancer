@@ -1,5 +1,4 @@
 import pathlib
-import sqlite3
 import json
 
 import cat_db
@@ -76,10 +75,10 @@ def test_main_defaults_to_current_directory_config(monkeypatch, tmp_path):
     result = main.main([])
 
     assert result == 0
-    assert seen == [(tmp_path / "config.yaml", False)]
+    assert seen == [(tmp_path / "config.yaml", True)]
 
 
-def test_main_passes_verbose_flag_to_start_everything(monkeypatch, tmp_path):
+def test_main_passes_silent_flag_to_start_everything(monkeypatch, tmp_path):
     config_path = tmp_path / "config.yaml"
     seen = []
 
@@ -89,10 +88,10 @@ def test_main_passes_verbose_flag_to_start_everything(monkeypatch, tmp_path):
 
     monkeypatch.setattr(main, "start_everything", fake_start_everything)
 
-    result = main.main(["--config", str(config_path), "--verbose"])
+    result = main.main(["--config", str(config_path), "--silent"])
 
     assert result == 0
-    assert seen == [(config_path, True)]
+    assert seen == [(config_path, False)]
 
 
 def test_start_everything_launches_tmux_before_load_balancer(monkeypatch, tmp_path):
@@ -137,29 +136,26 @@ def test_main_returns_130_on_keyboard_interrupt(monkeypatch, tmp_path):
     assert result == 130
 
 
-def write_log_db(db_path: pathlib.Path, rows: list[tuple[str, str, str]]):
-    with sqlite3.connect(db_path) as connection:
-        connection.execute(
-            """
-            CREATE TABLE request_response_log (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                input TEXT NOT NULL,
-                output TEXT NOT NULL,
-                endpoint_used TEXT NOT NULL
-            )
-            """
+def write_log_dir(log_dir: pathlib.Path, rows: list[tuple[str, str, str]]):
+    requests_dir = log_dir / "requests"
+    requests_dir.mkdir(parents=True, exist_ok=True)
+    for index, (input_text, output_text, endpoint_used) in enumerate(rows, start=1):
+        (requests_dir / f"{index:06d}.json").write_text(
+            json.dumps(
+                {
+                    "input": input_text,
+                    "output": output_text,
+                    "endpoint_used": endpoint_used,
+                }
+            ),
+            encoding="utf-8",
         )
-        connection.executemany(
-            "INSERT INTO request_response_log (input, output, endpoint_used) VALUES (?, ?, ?)",
-            rows,
-        )
-        connection.commit()
 
 
-def test_cat_db_uses_default_path_in_current_directory(monkeypatch, tmp_path, capsys):
-    monkeypatch.chdir(tmp_path)
-    db_path = tmp_path / "llm_loadbalancer.sqlite3"
-    write_log_db(
+def test_cat_db_uses_default_cache_path(monkeypatch, tmp_path, capsys):
+    db_path = tmp_path / "cache-home" / ".cache" / "llmup" / "logs"
+    monkeypatch.setenv("HOME", str(tmp_path / "cache-home"))
+    write_log_dir(
         db_path,
         [('{"a":1}', '{"b":2}', "http://127.0.0.1:18000/v1/chat/completions")],
     )
@@ -178,8 +174,8 @@ def test_cat_db_uses_default_path_in_current_directory(monkeypatch, tmp_path, ca
 
 
 def test_cat_db_accepts_explicit_db_path(tmp_path, capsys):
-    db_path = tmp_path / "custom.sqlite3"
-    write_log_db(
+    db_path = tmp_path / "custom-logs"
+    write_log_dir(
         db_path,
         [
             ('{"a":1}', '{"b":2}', "http://127.0.0.1:18000/v1/chat/completions"),
@@ -239,8 +235,8 @@ def test_cat_db_render_row_pretty_formats_messages_readably():
 
 
 def test_cat_db_uses_non_interactive_output_when_stdout_is_not_a_tty(monkeypatch, tmp_path, capsys):
-    db_path = tmp_path / "custom.sqlite3"
-    write_log_db(
+    db_path = tmp_path / "custom-logs"
+    write_log_dir(
         db_path,
         [('{"a":1}', '{"b":2}', "http://127.0.0.1:18000/v1/chat/completions")],
     )

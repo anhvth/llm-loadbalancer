@@ -1,6 +1,5 @@
 import http.client
 import json
-import sqlite3
 import socket
 import subprocess
 import threading
@@ -208,12 +207,26 @@ def write_config(config_path: Path, upstream_ports: list[int], listen_port: int)
 
 
 def read_log_rows(db_path: Path) -> list[tuple[int, str, str, str]]:
-    with sqlite3.connect(db_path) as connection:
-        return list(
-            connection.execute(
-                "SELECT id, input, output, endpoint_used FROM request_response_log ORDER BY id"
+    def encode_logged_value(value):
+        if value == {}:
+            return ""
+        if isinstance(value, (dict, list)):
+            return json.dumps(value)
+        return value
+
+    requests_dir = db_path / "requests"
+    rows = []
+    for index, path in enumerate(sorted(requests_dir.glob("*.json")), start=1):
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        rows.append(
+            (
+                index,
+                encode_logged_value(payload["input"]),
+                encode_logged_value(payload["output"]),
+                payload["endpoint_used"],
             )
         )
+    return rows
 
 
 def test_curl_localhost_8001_models(tmp_path: Path):
@@ -263,10 +276,10 @@ def test_proxies_large_post_payload(tmp_path: Path):
 
 def test_logs_json_request_response_to_sqlite(tmp_path: Path):
     config_path = tmp_path / "config.yaml"
-    db_path = tmp_path / "requests.sqlite3"
+    db_path = tmp_path / "request_logs"
     upstream_ports = find_free_port_block(1)
     write_config(config_path, upstream_ports, 8001)
-    config_path.write_text(config_path.read_text() + f"  db-path: {db_path}\n")
+    config_path.write_text(config_path.read_text() + f"  log-dir: {db_path}\n")
     request_payload = {"model": "demo", "messages": [{"role": "user", "content": "hi"}]}
 
     with run_stub_server(upstream_ports[0]), run_load_balancer(config_path) as listen_port:
@@ -295,10 +308,10 @@ def test_logs_json_request_response_to_sqlite(tmp_path: Path):
 
 def test_logs_bodyless_json_response_to_sqlite(tmp_path: Path):
     config_path = tmp_path / "config.yaml"
-    db_path = tmp_path / "requests.sqlite3"
+    db_path = tmp_path / "request_logs"
     upstream_ports = find_free_port_block(1)
     write_config(config_path, upstream_ports, 8001)
-    config_path.write_text(config_path.read_text() + f"  db-path: {db_path}\n")
+    config_path.write_text(config_path.read_text() + f"  log-dir: {db_path}\n")
 
     with run_stub_server(upstream_ports[0]), run_load_balancer(config_path) as listen_port:
         conn = http.client.HTTPConnection("127.0.0.1", listen_port, timeout=30)
@@ -320,10 +333,10 @@ def test_logs_bodyless_json_response_to_sqlite(tmp_path: Path):
 
 def test_logs_assign_incrementing_ids(tmp_path: Path):
     config_path = tmp_path / "config.yaml"
-    db_path = tmp_path / "requests.sqlite3"
+    db_path = tmp_path / "request_logs"
     upstream_ports = find_free_port_block(1)
     write_config(config_path, upstream_ports, 8001)
-    config_path.write_text(config_path.read_text() + f"  db-path: {db_path}\n")
+    config_path.write_text(config_path.read_text() + f"  log-dir: {db_path}\n")
 
     with run_stub_server(upstream_ports[0]), run_load_balancer(config_path) as listen_port:
         for index in range(2):
@@ -344,10 +357,10 @@ def test_logs_assign_incrementing_ids(tmp_path: Path):
 
 def test_verbose_prints_pretty_logged_payload(tmp_path: Path, capsys):
     config_path = tmp_path / "config.yaml"
-    db_path = tmp_path / "requests.sqlite3"
+    db_path = tmp_path / "request_logs"
     upstream_ports = find_free_port_block(1)
     write_config(config_path, upstream_ports, 8001)
-    config_path.write_text(config_path.read_text() + f"  db-path: {db_path}\n")
+    config_path.write_text(config_path.read_text() + f"  log-dir: {db_path}\n")
     request_payload = {"model": "demo", "messages": [{"role": "user", "content": "hi"}]}
 
     with run_stub_server(upstream_ports[0]), run_load_balancer(config_path, verbose=True) as listen_port:
@@ -364,30 +377,18 @@ def test_verbose_prints_pretty_logged_payload(tmp_path: Path, capsys):
 
     captured = capsys.readouterr()
     assert captured.out == ""
-    assert captured.err == (
-        "[request_response_log] inserted row:\n"
-        + json.dumps(
-            {
-                "id": 1,
-                "input": request_payload,
-                "output": {
-                    "received_bytes": len(json.dumps(request_payload)),
-                    "content_type": "application/json",
-                },
-                "endpoint_used": f"http://127.0.0.1:{upstream_ports[0]}/v1/chat/completions",
-            },
-            indent=2,
-        )
-        + "\n"
-    )
+    assert "[request_response_log] wrote file:\n" in captured.err
+    assert '"input": {' in captured.err
+    assert '"model": "demo"' in captured.err
+    assert f'"endpoint_used": "http://127.0.0.1:{upstream_ports[0]}/v1/chat/completions"' in captured.err
 
 
 def test_proxies_streaming_response(tmp_path: Path):
     config_path = tmp_path / "config.yaml"
-    db_path = tmp_path / "requests.sqlite3"
+    db_path = tmp_path / "request_logs"
     upstream_ports = find_free_port_block(2)
     write_config(config_path, upstream_ports, 8001)
-    config_path.write_text(config_path.read_text() + f"  db-path: {db_path}\n")
+    config_path.write_text(config_path.read_text() + f"  log-dir: {db_path}\n")
 
     with run_stub_server(upstream_ports[0]), run_stub_server(upstream_ports[1]), run_load_balancer(
         config_path
@@ -407,10 +408,10 @@ def test_proxies_streaming_response(tmp_path: Path):
 
 def test_logs_streaming_messages_as_final_json_shape(tmp_path: Path):
     config_path = tmp_path / "config.yaml"
-    db_path = tmp_path / "requests.sqlite3"
+    db_path = tmp_path / "request_logs"
     upstream_ports = find_free_port_block(1)
     write_config(config_path, upstream_ports, 8001)
-    config_path.write_text(config_path.read_text() + f"  db-path: {db_path}\n")
+    config_path.write_text(config_path.read_text() + f"  log-dir: {db_path}\n")
     request_payload = {
         "model": "demo-model",
         "messages": [{"role": "user", "content": "hi"}],
@@ -452,6 +453,163 @@ def test_logs_streaming_messages_as_final_json_shape(tmp_path: Path):
     ]
 
 
+def test_reuses_backend_for_matching_messages_prefix(tmp_path: Path):
+    config_path = tmp_path / "config.yaml"
+    db_path = tmp_path / "request_logs"
+    upstream_ports = find_free_port_block(2)
+    write_config(config_path, upstream_ports, 8001)
+    config_path.write_text(config_path.read_text() + f"  log-dir: {db_path}\n")
+
+    first_payload = {"model": "demo", "messages": [{"role": "user", "content": "hi"}]}
+    second_payload = {
+        "model": "demo",
+        "messages": [
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": "hello"},
+            {"role": "user", "content": "tell me more"},
+        ],
+    }
+
+    with run_stub_server(upstream_ports[0]), run_stub_server(upstream_ports[1]), run_load_balancer(
+        config_path
+    ) as listen_port:
+        conn = http.client.HTTPConnection("127.0.0.1", listen_port, timeout=30)
+        conn.request(
+            "POST",
+            "/v1/chat/completions",
+            body=json.dumps(first_payload),
+            headers={"Content-Type": "application/json"},
+        )
+        response = conn.getresponse()
+        response.read()
+        conn.close()
+
+        conn = http.client.HTTPConnection("127.0.0.1", listen_port, timeout=30)
+        conn.request(
+            "POST",
+            "/v1/chat/completions",
+            body=json.dumps(second_payload),
+            headers={"Content-Type": "application/json"},
+        )
+        response = conn.getresponse()
+        response.read()
+        conn.close()
+
+    rows = read_log_rows(db_path)
+    assert len(rows) == 2
+    assert rows[0][3] == rows[1][3]
+
+
+def test_shares_messages_affinity_across_load_balancer_workers_via_sqlite(tmp_path: Path):
+    config_path = tmp_path / "config.yaml"
+    db_path = tmp_path / "request_logs"
+    affinity_db_path = tmp_path / "affinity.sqlite3"
+    upstream_ports = find_free_port_block(2)
+    write_config(config_path, upstream_ports, 8001)
+    config_path.write_text(
+        config_path.read_text()
+        + f"  log-dir: {db_path}\n"
+        + f"  affinity-db: {affinity_db_path}\n"
+    )
+
+    first_payload = json.dumps(
+        {"model": "demo", "messages": [{"role": "user", "content": "hi"}]}
+    ).encode("utf-8")
+    second_payload = json.dumps(
+        {
+            "model": "demo",
+            "messages": [
+                {"role": "user", "content": "hi"},
+                {"role": "assistant", "content": "hello"},
+                {"role": "user", "content": "tell me more"},
+            ],
+        }
+    ).encode("utf-8")
+
+    app_a = create_app(config_path)
+    app_b = create_app(config_path)
+    app_a._remember_messages_affinity(first_payload, upstream_ports[0])
+
+    assert app_b._find_messages_affinity_port(second_payload) == upstream_ports[0]
+
+
+def test_reuses_messages_affinity_when_message_shape_changes(tmp_path: Path):
+    config_path = tmp_path / "config.yaml"
+    db_path = tmp_path / "request_logs"
+    upstream_ports = find_free_port_block(2)
+    write_config(config_path, upstream_ports, 8001)
+    config_path.write_text(config_path.read_text() + f"  log-dir: {db_path}\n")
+
+    first_payload = json.dumps(
+        {
+            "model": "demo",
+            "messages": [
+                {"content": "ok", "role": "user"},
+                {
+                    "content": [
+                        {"cache_control": {"type": "ephemeral"}, "text": "hi", "type": "text"}
+                    ],
+                    "role": "user",
+                },
+            ],
+        }
+    ).encode("utf-8")
+    second_payload = json.dumps(
+        {
+            "model": "demo",
+            "messages": [
+                {"content": "ok", "role": "user"},
+                {"content": "hi", "role": "user"},
+                {"content": "hello", "role": "assistant"},
+                {"content": "tell me more", "role": "user"},
+            ],
+        }
+    ).encode("utf-8")
+
+    app = create_app(config_path)
+    app._remember_messages_affinity(first_payload, upstream_ports[0])
+
+    assert app._find_messages_affinity_port(second_payload) == upstream_ports[0]
+
+
+def test_affinity_lookup_normalizes_each_candidate_message_once(tmp_path: Path, monkeypatch):
+    config_path = tmp_path / "config.yaml"
+    upstream_ports = find_free_port_block(2)
+    write_config(config_path, upstream_ports, 8001)
+
+    prefix_messages = [
+        {"role": "user", "content": "one"},
+        {"role": "assistant", "content": "two"},
+        {"role": "user", "content": "three"},
+        {"role": "assistant", "content": "four"},
+    ]
+    lookup_payload = json.dumps(
+        {
+            "model": "demo",
+            "messages": [*prefix_messages, {"role": "user", "content": "five"}],
+        }
+    ).encode("utf-8")
+
+    app = create_app(config_path)
+    app._remember_messages_affinity(
+        json.dumps({"model": "demo", "messages": prefix_messages}).encode("utf-8"),
+        upstream_ports[0],
+    )
+
+    original_prefix_keys = app._messages_prefix_keys
+    call_count = 0
+
+    def counting_prefix_keys(messages):
+        nonlocal call_count
+        call_count += 1
+        return original_prefix_keys(messages)
+
+    monkeypatch.setattr(app, "_messages_prefix_keys", counting_prefix_keys)
+
+    assert app._find_messages_affinity_port(lookup_payload) == upstream_ports[0]
+    assert call_count == 1
+
+
 def test_parse_config_resolves_default_db_path_relative_to_config(tmp_path: Path):
     config_path = tmp_path / "config.yaml"
     upstream_ports = find_free_port_block(1)
@@ -459,7 +617,8 @@ def test_parse_config_resolves_default_db_path_relative_to_config(tmp_path: Path
 
     cfg = parse_config(config_path)
 
-    assert cfg.load_balancer_db_path == tmp_path / "llm_loadbalancer.sqlite3"
+    assert cfg.load_balancer_log_dir == Path("~/.cache/llmup/logs").expanduser()
+    assert cfg.load_balancer_affinity_db_path == Path("~/.cache/llmup/affinity.sqlite3").expanduser()
 
 
 def test_serve_forever_does_not_enable_reload(monkeypatch, tmp_path: Path):

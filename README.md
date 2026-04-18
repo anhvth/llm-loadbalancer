@@ -36,45 +36,47 @@ load-balancer:
   max-connections: 20000
   max-keepalive-connections: 4096
   upstream-timeout: 300
-  db-path: llm_loadbalancer.sqlite3
+  log-dir: ~/.cache/llmup/logs
+  affinity-db: ~/.cache/llmup/affinity.sqlite3
 ```
 
-`db-path` is optional. If omitted, the load balancer writes to
-`llm_loadbalancer.sqlite3` in the same directory as the config file.
+`log-dir` and `affinity-db` are optional. If omitted, the load balancer writes
+request log files to `~/.cache/llmup/logs` and stores shared message-affinity
+state in `~/.cache/llmup/affinity.sqlite3`.
 
 ### Commands
 
 - `uv run llmproxy` — start the load balancer (creates a default `config.yaml` if one does not exist)
 - `uv run llmproxy --set-config` — open the config file in your editor
-- `uv run llmproxy --verbose` — print each logged request/response row to stderr
-- `uv run cat_db` — inspect the SQLite log in an interactive terminal
+- `uv run llmproxy --silent` — disable printing each logged request/response file to stderr
+- `uv run cat_db` — inspect the request log directory in an interactive terminal
 - `uv run cat_db --raw` — print one JSON object per line (for scripting)
 
 ## Request Logging
 
-Completed JSON request/response pairs are stored in a local SQLite table named
-`request_response_log` with these columns:
+Completed request/response pairs are written as individual JSON files under
+`<log-dir>/requests`. Each file contains:
 
-- `id` integer primary key, auto-incrementing
 - `input` JSON request body as text
 - `output` JSON response body as text
 - `endpoint_used` full upstream URL selected for the request
 
-Only complete JSON exchanges are logged. Streaming responses such as SSE and
-non-JSON traffic are proxied normally but skipped in the database.
+The request path only enqueues the log record. A background thread writes the
+files, so proxying is not blocked on disk I/O. Message affinity is shared across
+workers through the SQLite database at `affinity-db`.
 
-## Inspect Logged Rows
+## Inspect Logged Requests
 
-Use `cat_db` to inspect the SQLite rows with a readable pretty view by default:
+Use `cat_db` to inspect the request log files with a readable pretty view by default:
 
 ```bash
 uv run cat_db
-uv run cat_db /path/to/custom.sqlite3
+uv run cat_db /path/to/custom-log-dir
 uv run cat_db --raw
 ```
 
-Without an argument, `cat_db` reads `./llm_loadbalancer.sqlite3`.
+Without an argument, `cat_db` reads `~/.cache/llmup/logs`.
 
-- Default mode formats one row at a time and, in an interactive terminal, lets
+- Default mode formats one request at a time and, in an interactive terminal, lets
   you move with `Enter`, arrow keys, `j`/`k`, `gg`/`G`, and quit with `q`.
 - Use `--raw` to print one JSON object per line for scripts or piping.

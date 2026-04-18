@@ -4,13 +4,18 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import pathlib
+import queue
 import random
 import sqlite3
 import sys
-from typing import Any, AsyncIterator
+import threading
+import time
+from typing import Any
+import uuid
 
 import httpx
 import uvicorn
@@ -28,7 +33,138 @@ HOP_BY_HOP_HEADERS = {
     b"upgrade",
 }
 
-REQUEST_RESPONSE_LOG_TABLE = "request_response_log"
+MESSAGE_AFFINITY_CACHE_SIZE = 4096
+MESSAGE_AFFINITY_IGNORED_KEYS = {"cache_control", "role", "signature", "type"}
+REQUEST_LOGS_DIRNAME = "requests"
+
+
+class AsyncFileLogWriter:
+    def __init__(self, root_dir: pathlib.Path, verbose: bool = False):
+        self.root_dir = root_dir
+        self.verbose = verbose
+        self.requests_dir = root_dir / REQUEST_LOGS_DIRNAME
+        self._queue: queue.Queue[dict[str, Any] | None] = queue.Queue()
+        self._thread: threading.Thread | None = None
+
+    def start(self) -> None:
+        self.root_dir.mkdir(parents=True, exist_ok=True)
+        self.requests_dir.mkdir(parents=True, exist_ok=True)
+        self._thread = threading.Thread(target=self._run, name="request-log-writer", daemon=True)
+        self._thread.start()
+
+    def submit(self, payload: dict[str, Any]) -> None:
+        self._queue.put_nowait(payload)
+
+    def close(self) -> None:
+        if self._thread is None:
+            return
+        self._queue.put(None)
+        self._thread.join()
+        self._thread = None
+
+    def _run(self) -> None:
+        while True:
+            payload = self._queue.get()
+            try:
+                if payload is None:
+                    return
+                path = self._write_payload(payload)
+                if self.verbose:
+                    self._print_logged_payload(path, payload)
+            finally:
+                self._queue.task_done()
+
+    def _write_payload(self, payload: dict[str, Any]) -> pathlib.Path:
+        file_name = f"{time.time_ns()}-{os.getpid()}-{uuid.uuid4().hex}.json"
+        final_path = self.requests_dir / file_name
+        tmp_path = final_path.with_suffix(".tmp")
+        tmp_path.write_text(json.dumps(payload), encoding="utf-8")
+        tmp_path.replace(final_path)
+        return final_path
+
+    def _print_logged_payload(self, path: pathlib.Path, payload: dict[str, Any]) -> None:
+        print(
+            "[request_response_log] wrote file:\n"
+            + json.dumps(
+                {
+                    "path": str(path),
+                    "input": payload.get("input", ""),
+                    "output": payload.get("output", ""),
+                    "endpoint_used": payload.get("endpoint_used", ""),
+                },
+                indent=2,
+            ),
+            file=sys.stderr,
+        )
+
+
+class SqliteMessageAffinityStore:
+    def __init__(self, path: pathlib.Path, max_entries: int):
+        self.path = path
+        self.max_entries = max_entries
+        self._lock = threading.Lock()
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.connection = sqlite3.connect(
+            self.path,
+            timeout=30,
+            isolation_level=None,
+            check_same_thread=False,
+        )
+        with self._lock:
+            self.connection.execute("PRAGMA journal_mode=WAL")
+            self.connection.execute("PRAGMA synchronous=NORMAL")
+            self.connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS message_affinity (
+                    prefix_key TEXT PRIMARY KEY,
+                    upstream_port INTEGER NOT NULL,
+                    last_access_ns INTEGER NOT NULL
+                )
+                """
+            )
+
+    def close(self) -> None:
+        with self._lock:
+            self.connection.close()
+
+    def get(self, prefix_key: str) -> int | None:
+        with self._lock:
+            row = self.connection.execute(
+                "SELECT upstream_port FROM message_affinity WHERE prefix_key = ?",
+                (prefix_key,),
+            ).fetchone()
+            if row is None:
+                return None
+            self.connection.execute(
+                "UPDATE message_affinity SET last_access_ns = ? WHERE prefix_key = ?",
+                (time.time_ns(), prefix_key),
+            )
+            return int(row[0])
+
+    def set(self, prefix_key: str, upstream_port: int) -> None:
+        with self._lock:
+            self.connection.execute(
+                """
+                INSERT INTO message_affinity(prefix_key, upstream_port, last_access_ns)
+                VALUES(?, ?, ?)
+                ON CONFLICT(prefix_key) DO UPDATE SET
+                    upstream_port = excluded.upstream_port,
+                    last_access_ns = excluded.last_access_ns
+                """,
+                (prefix_key, upstream_port, time.time_ns()),
+            )
+            self.connection.execute(
+                """
+                DELETE FROM message_affinity
+                WHERE prefix_key IN (
+                    SELECT prefix_key
+                    FROM message_affinity
+                    ORDER BY last_access_ns DESC
+                    LIMIT -1 OFFSET ?
+                )
+                """,
+                (self.max_entries,),
+            )
 
 
 def build_upstream_ports(cfg: TunnelConfig) -> list[int]:
@@ -36,12 +172,16 @@ def build_upstream_ports(cfg: TunnelConfig) -> list[int]:
 
 
 class LoadBalancerApp:
-    def __init__(self, cfg: TunnelConfig, verbose: bool = False):
+    def __init__(self, cfg: TunnelConfig, verbose: bool = True):
         self.cfg = cfg
         self.verbose = verbose
         self.upstream_ports = build_upstream_ports(cfg)
         self.client: httpx.AsyncClient | None = None
-        self.db: sqlite3.Connection | None = None
+        self.message_affinity = SqliteMessageAffinityStore(
+            cfg.load_balancer_affinity_db_path,
+            MESSAGE_AFFINITY_CACHE_SIZE,
+        )
+        self.log_writer = AsyncFileLogWriter(cfg.load_balancer_log_dir, verbose=verbose)
 
     async def __call__(self, scope, receive, send) -> None:
         scope_type = scope["type"]
@@ -60,15 +200,14 @@ class LoadBalancerApp:
             message = await receive()
             if message["type"] == "lifespan.startup":
                 self.client = self._build_client()
-                self.db = self._open_log_db()
+                self.log_writer.start()
                 await send({"type": "lifespan.startup.complete"})
             elif message["type"] == "lifespan.shutdown":
                 if self.client is not None:
                     await self.client.aclose()
                     self.client = None
-                if self.db is not None:
-                    self.db.close()
-                    self.db = None
+                self.message_affinity.close()
+                self.log_writer.close()
                 await send({"type": "lifespan.shutdown.complete"})
                 return
 
@@ -85,21 +224,6 @@ class LoadBalancerApp:
         )
         return httpx.AsyncClient(timeout=timeout, limits=limits)
 
-    def _open_log_db(self) -> sqlite3.Connection:
-        db = sqlite3.connect(self.cfg.load_balancer_db_path)
-        db.execute(
-            f"""
-            CREATE TABLE IF NOT EXISTS {REQUEST_RESPONSE_LOG_TABLE} (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                input TEXT NOT NULL,
-                output TEXT NOT NULL,
-                endpoint_used TEXT NOT NULL
-            )
-            """
-        )
-        db.commit()
-        return db
-
     async def _handle_http(self, scope, receive, send) -> None:
         if not self.upstream_ports:
             await self._send_plain_error(send, 503, b"No upstream ports configured")
@@ -112,25 +236,22 @@ class LoadBalancerApp:
         if query_string:
             path = f"{path}?{query_string.decode('latin1')}"
 
-        upstream_port = random.choice(self.upstream_ports)
+        request_chunks = bytearray()
+        while True:
+            message = await receive()
+            if message["type"] != "http.request":
+                continue
+            body = message.get("body", b"")
+            if body:
+                request_chunks.extend(body)
+            if not message.get("more_body", False):
+                break
+
+        request_body = bytes(request_chunks)
+        upstream_port = self._choose_upstream_port(request_body)
         upstream_url = f"http://127.0.0.1:{upstream_port}{path}"
         headers = self._build_upstream_headers(scope["headers"], upstream_port)
-
-        request_chunks = bytearray()
-
-        async def request_body() -> AsyncIterator[bytes]:
-            while True:
-                message = await receive()
-                if message["type"] != "http.request":
-                    continue
-                body = message.get("body", b"")
-                if body:
-                    request_chunks.extend(body)
-                    yield body
-                if not message.get("more_body", False):
-                    break
-
-        request = client.build_request(method, upstream_url, headers=headers, content=request_body())
+        request = client.build_request(method, upstream_url, headers=headers, content=request_body)
 
         try:
             response = await client.send(request, stream=True)
@@ -163,8 +284,9 @@ class LoadBalancerApp:
             await response.aclose()
 
         await send({"type": "http.response.body", "body": b"", "more_body": False})
+        self._remember_messages_affinity(request_body, upstream_port)
         self._log_exchange(
-            bytes(request_chunks),
+            request_body,
             bytes(response_chunks),
             upstream_url,
             response.headers.get("content-type"),
@@ -204,6 +326,73 @@ class LoadBalancerApp:
             return json.loads(body_text)
         except json.JSONDecodeError:
             return None
+
+    def _choose_upstream_port(self, request_body: bytes) -> int:
+        affinity_port = self._find_messages_affinity_port(request_body)
+        if affinity_port is not None:
+            return affinity_port
+        return random.choice(self.upstream_ports)
+
+    def _find_messages_affinity_port(self, request_body: bytes) -> int | None:
+        payload = self._decode_json_value(self._decode_body_text(request_body))
+        if not isinstance(payload, dict):
+            return None
+        messages = payload.get("messages")
+        if not isinstance(messages, list):
+            return None
+        if len(messages) <= 1:
+            return None
+
+        for prefix_key in reversed(self._messages_prefix_keys(messages[:-1])):
+            cached_port = self.message_affinity.get(prefix_key)
+            if cached_port is not None:
+                return cached_port
+        return None
+
+    def _remember_messages_affinity(self, request_body: bytes, upstream_port: int) -> None:
+        payload = self._decode_json_value(self._decode_body_text(request_body))
+        if not isinstance(payload, dict):
+            return
+        messages = payload.get("messages")
+        if not isinstance(messages, list) or not messages:
+            return
+
+        prefix_key = self._messages_prefix_keys(messages)[-1]
+        self._cache_messages_affinity(prefix_key, upstream_port)
+
+    def _cache_messages_affinity(self, prefix_key: str, upstream_port: int) -> None:
+        self.message_affinity.set(prefix_key, upstream_port)
+
+    def _messages_prefix_key(self, messages: list[Any]) -> str:
+        return self._messages_prefix_keys(messages)[-1]
+
+    def _messages_prefix_keys(self, messages: list[Any]) -> list[str]:
+        hasher = hashlib.sha256()
+        prefix_keys: list[str] = []
+        for index, message in enumerate(messages):
+            if index:
+                hasher.update(b"\n")
+            hasher.update(self._normalize_message_for_affinity(message).encode("utf-8"))
+            prefix_keys.append(hasher.copy().hexdigest())
+        return prefix_keys
+
+    def _normalize_message_for_affinity(self, value: Any) -> str:
+        if value is None:
+            return ""
+        if isinstance(value, (str, int, float, bool)):
+            return str(value)
+        if isinstance(value, list):
+            return "\x1e".join(
+                part for item in value if (part := self._normalize_message_for_affinity(item))
+            )
+        if isinstance(value, dict):
+            return "\x1f".join(
+                part
+                for key in sorted(value)
+                if key not in MESSAGE_AFFINITY_IGNORED_KEYS
+                if (part := self._normalize_message_for_affinity(value[key]))
+            )
+        return repr(value)
 
     def _normalize_sse_payload(self, response_text: str) -> str | None:
         parsed_events: list[dict[str, Any]] = []
@@ -362,45 +551,29 @@ class LoadBalancerApp:
         endpoint_used: str,
         content_type: str | None = None,
     ) -> None:
-        if self.db is None:
-            return
         try:
             request_text = self._decode_body_text(request_body)
             response_text = self._decode_body_text(response_body)
         except UnicodeDecodeError:
             return
         response_text = self._normalize_logged_response(response_text, content_type)
-        cursor = self.db.execute(
-            f"INSERT INTO {REQUEST_RESPONSE_LOG_TABLE} (input, output, endpoint_used) VALUES (?, ?, ?)",
-            (request_text, response_text, endpoint_used),
-        )
-        self.db.commit()
-        if self.verbose:
-            row_id = cursor.lastrowid
-            if row_id is None:
-                return
-            self._print_logged_row(
-                row_id=int(row_id),
-                request_text=request_text,
-                response_text=response_text,
-                endpoint_used=endpoint_used,
-            )
 
-    def _print_logged_row(
-        self, row_id: int, request_text: str, response_text: str, endpoint_used: str
-    ) -> None:
-        print(
-            "[request_response_log] inserted row:\n"
-            + json.dumps(
-                {
-                    "id": row_id,
-                    "input": self._decode_json_value(request_text) if request_text else request_text,
-                    "output": self._decode_json_value(response_text) if response_text else response_text,
-                    "endpoint_used": endpoint_used,
-                },
-                indent=2,
-            ),
-            file=sys.stderr,
+        try:
+            request_json = json.loads(request_text) if request_text else {}
+        except json.JSONDecodeError:
+            request_json = request_text
+
+        try:
+            response_json = json.loads(response_text) if response_text else {}
+        except json.JSONDecodeError:
+            response_json = response_text
+
+        self.log_writer.submit(
+            {
+                "input": request_json,
+                "output": response_json,
+                "endpoint_used": endpoint_used,
+            }
         )
 
 
@@ -417,7 +590,7 @@ def create_app(config_path: pathlib.Path | None = None, verbose: bool | None = N
     return LoadBalancerApp(cfg, verbose=verbose)
 
 
-def serve_forever(config_path: pathlib.Path = pathlib.Path("config.yaml"), verbose: bool = False) -> None:
+def serve_forever(config_path: pathlib.Path = pathlib.Path("config.yaml"), verbose: bool = True) -> None:
     cfg = parse_config(config_path)
     os.environ["LLM_LOADBALANCER_CONFIG"] = str(config_path)
     os.environ["LLM_LOADBALANCER_VERBOSE"] = "1" if verbose else "0"
@@ -444,8 +617,14 @@ def main(argv: list[str] | None = None) -> int:
         default=pathlib.Path("config.yaml"),
         help="Path to the shared config file",
     )
+    parser.add_argument(
+        "-s",
+        "--silent",
+        action="store_true",
+        help="Disable verbose logging to terminal",
+    )
     args = parser.parse_args(argv)
-    verbose = os.environ.get("LLM_LOADBALANCER_VERBOSE", "0") == "1"
+    verbose = not args.silent and os.environ.get("LLM_LOADBALANCER_VERBOSE", "1") == "1"
     serve_forever(args.config, verbose=verbose)
     return 0
 

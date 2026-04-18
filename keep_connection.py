@@ -40,7 +40,10 @@ class TunnelConfig:
     load_balancer_max_connections: int = 20000
     load_balancer_max_keepalive_connections: int = 4096
     load_balancer_upstream_timeout: float = 300.0
-    load_balancer_db_path: pathlib.Path = pathlib.Path("llm_loadbalancer.sqlite3")
+    load_balancer_log_dir: pathlib.Path = pathlib.Path("~/.cache/llmup/logs").expanduser()
+    load_balancer_affinity_db_path: pathlib.Path = pathlib.Path(
+        "~/.cache/llmup/affinity.sqlite3"
+    ).expanduser()
     user: str | None = None
     ssh_options: list[str] = dataclasses.field(default_factory=list)
     tmux_session_name: str = "keepssh"
@@ -74,6 +77,13 @@ def expand_host_pattern(pattern: str) -> list[str]:
         else:
             hosts.append(f"{prefix}{part}")
     return hosts
+
+
+def resolve_config_relative_path(config_path: pathlib.Path, raw_path: str) -> pathlib.Path:
+    candidate = pathlib.Path(raw_path).expanduser()
+    if candidate.is_absolute():
+        return candidate
+    return config_path.parent / candidate
 
 
 def parse_config(path: pathlib.Path) -> TunnelConfig:
@@ -152,7 +162,14 @@ def parse_config(path: pathlib.Path) -> TunnelConfig:
         load_balancer.get("max-keepalive-connections", "4096")
     )
     load_balancer_upstream_timeout = float(load_balancer.get("upstream-timeout", "300"))
-    load_balancer_db_path = path.parent / load_balancer.get("db-path", "llm_loadbalancer.sqlite3")
+    load_balancer_log_dir = resolve_config_relative_path(
+        path,
+        load_balancer.get("log-dir", "~/.cache/llmup/logs")
+    )
+    load_balancer_affinity_db_path = resolve_config_relative_path(
+        path,
+        load_balancer.get("affinity-db", "~/.cache/llmup/affinity.sqlite3")
+    )
     user = merged.get("user")
     ssh_options = shlex.split(merged.get("ssh-options", ""))
     tmux_session_name = tmux.get("session-name", "keepssh")
@@ -167,7 +184,8 @@ def parse_config(path: pathlib.Path) -> TunnelConfig:
         load_balancer_max_connections=load_balancer_max_connections,
         load_balancer_max_keepalive_connections=load_balancer_max_keepalive_connections,
         load_balancer_upstream_timeout=load_balancer_upstream_timeout,
-        load_balancer_db_path=load_balancer_db_path,
+        load_balancer_log_dir=load_balancer_log_dir,
+        load_balancer_affinity_db_path=load_balancer_affinity_db_path,
         user=user,
         ssh_options=ssh_options,
         tmux_session_name=tmux_session_name,
