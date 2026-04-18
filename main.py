@@ -61,13 +61,13 @@ def open_config_in_editor(config_path: pathlib.Path) -> int:
     return 0
 
 
-def start_everything(config_path: pathlib.Path) -> int:
+def start_everything(config_path: pathlib.Path, verbose: bool = False) -> int:
     ensure_config_exists(config_path)
     cfg = parse_config(config_path)
     commands = list(iter_commands(cfg))
     launch_in_tmux(cfg.tmux_session_name, commands)
     print(f"Started SSH tunnels in tmux session: {cfg.tmux_session_name}", file=sys.stderr)
-    serve_forever(config_path)
+    serve_forever(config_path, verbose=verbose)
     return 0
 
 
@@ -86,6 +86,11 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Open the config file in your editor and exit",
     )
+    parser.add_argument(
+        "--verbose",
+        action="store_true",
+        help="Print each JSON request/response row when it is inserted into the local DB",
+    )
     return parser
 
 
@@ -97,7 +102,7 @@ def main(argv: list[str] | None = None) -> int:
         return open_config_in_editor(args.config)
 
     try:
-        return start_everything(args.config)
+        return start_everything(args.config, verbose=args.verbose)
     except KeyboardInterrupt:
         return 130
 
