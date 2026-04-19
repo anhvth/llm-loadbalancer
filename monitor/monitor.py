@@ -6,7 +6,6 @@ from __future__ import annotations
 import json
 import os
 import sqlite3
-import sys
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -18,9 +17,6 @@ from fastapi.responses import HTMLResponse, Response
 
 
 ROOT_DIR = Path(__file__).resolve().parents[1]
-if str(ROOT_DIR) not in sys.path:
-    sys.path.insert(0, str(ROOT_DIR))
-
 try:
     from keep_connection import parse_config
 except Exception:  # pragma: no cover - fallback when the parent module is unavailable.
