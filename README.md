@@ -29,6 +29,7 @@ port:
 load-balancer:
   workers: 4
   worker-concurrency: 10204
+  routing: smart
   health-path: /models
   log-dir: ~/.cache/llm-proxy/logs
   affinity-db: ~/.cache/llm-proxy/affinity.sqlite3
@@ -37,7 +38,10 @@ port-start: 18001
 ```
 
 `endpoints.setup` defaults to `ssh`. Use `setup: "direct"` when the load
-balancer can already reach the worker hosts without SSH tunneling. `health-path`,
+balancer can already reach the worker hosts without SSH tunneling. `routing`
+defaults to `smart`, which keeps related chat turns on the same upstream with
+message affinity. Use `routing: random` or `llm-proxy --routing random` to
+disable affinity and choose a random upstream for every request. `health-path`,
 `log-dir`, and `affinity-db` are optional. If omitted, the load balancer probes
 `/models`, writes request log files to `~/.cache/llm-proxy/logs` and stores
 shared message-affinity state in `~/.cache/llm-proxy/affinity.sqlite3`. Local
@@ -50,6 +54,7 @@ Per-worker upstream connection limits are derived automatically from
 
 - `uvx --from git+https://github.com/anhvth/llm-loadbalancer llm-proxy --set-config` — create and open `~/.config/llm-proxy.yaml`
 - `uvx --from git+https://github.com/anhvth/llm-loadbalancer llm-proxy` — start the load balancer after config is set
+- `uvx --from git+https://github.com/anhvth/llm-loadbalancer llm-proxy --routing random` — start with pure random routing
 - `uvx --from git+https://github.com/anhvth/llm-loadbalancer cat_db` — inspect the request log directory in an interactive terminal
 - `uvx --from git+https://github.com/anhvth/llm-loadbalancer cat_db --raw` — print one JSON object per line for scripting
 

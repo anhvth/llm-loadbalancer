@@ -64,5 +64,13 @@ Strong success criteria let you loop independently. Weak criteria ("make it work
 
 **These guidelines are working if:** fewer unnecessary changes in diffs, fewer rewrites due to overcomplication, and clarifying questions come before implementation rather than after mistakes.
 
+## 5. Training Data Conversion Notes
+
+When working on SFT data conversion:
+- Anthropic/Claude request logs need provider-specific conversion; keep that code named explicitly (for example `convert_to_sft_data_anthropic.py`) instead of implying a generic converter.
+- Qwen chat templates may ignore `reasoning_content` on historical assistant turns before the last real user query. For Qwen SFT, inline historical assistant thinking into `content` as `<think>...</think>` while preserving the final target assistant turn's native `reasoning_content`.
+- Anthropic assistant text often starts with leading newlines. When injecting `<think>...</think>\n\n`, strip only leading newlines from the assistant body so rendered prompts do not get extra blank lines.
+- Deduplicating collected conversations must normalize streamed tool calls: whitespace-only text blocks should not split conversations, and `tool_use.partial_json` should be parsed to the same `input` shape used by completed history when possible.
+- After changing conversion or dedupe logic, regenerate `collected.unique.jsonl` and `collected.unique_sft.jsonl`, then inspect row counts and at least one rendered chat-template sample.
 
 
