@@ -39,7 +39,7 @@ def build_app(monkeypatch, tmp_path: Path, upstream_ports: list[int]) -> load_ba
         load_balancer_v2.LoadBalancerAppV2,
         "_initial_healthcheck",
         lambda self: [
-            load_balancer_v2.lb.EndpointCheckResult(host=host, port=port)
+            load_balancer_v2.EndpointCheckResult(host=host, port=port)
             for host, port in self.upstream_endpoints
         ],
     )
