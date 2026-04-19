@@ -41,7 +41,9 @@ only-include = [
     "src/llm_loadbalancer/tools/__init__.py",
     "src/llm_loadbalancer/tools/collect_jsonl.py",
     "src/llm_loadbalancer/tools/annotate_full_conversations.py",
-    "src/llm_loadbalancer/tools/convert_anthropic_messages_to_sft.py",
+    "src/llm_loadbalancer/tools/convert_to_sft_data.py",
+    "src/llm_loadbalancer/tools/convert_to_sft_data_anthropic.py",
+    "src/llm_loadbalancer/tools/convert_to_sft_data_openai.py",
 ]
 
 [tool.pytest.ini_options]
