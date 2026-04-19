@@ -1,4 +1,4 @@
-from llm_utils import *
+from llm_utils import LLM
 
 llm = LLM(8001)
 output = llm('hi openai')

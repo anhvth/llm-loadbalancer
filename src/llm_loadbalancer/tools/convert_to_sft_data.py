@@ -1,5 +1,6 @@
 import argparse
 import json
+import os
 from pathlib import Path
 from typing import Any
 
@@ -7,6 +8,11 @@ from llm_loadbalancer.tools import (
     convert_to_sft_data_anthropic,
     convert_to_sft_data_openai,
 )
+
+
+DEFAULT_TOKENIZER = "Qwen/Qwen3.5-27B"
+_IM_START = "<|im_start|>"
+_IM_END = "<|im_end|>"
 
 
 def _is_openai_chat_record(record: dict[str, Any]) -> bool:
@@ -20,12 +26,84 @@ def convert_record(record: dict[str, Any]):
     return convert_to_sft_data_anthropic.anthropic_format_to_train_sft(record)
 
 
+def _load_tokenizer(tokenizer_name: str):
+    os.environ.setdefault("TRANSFORMERS_NO_ADVISORY_WARNINGS", "1")
+
+    from transformers import AutoTokenizer
+
+    return AutoTokenizer.from_pretrained(tokenizer_name)
+
+
+def _record_tools(record: dict[str, Any]) -> list[dict[str, Any]] | None:
+    source = record.get("input")
+    if not isinstance(source, dict):
+        source = record
+
+    tools = source.get("tools")
+    if isinstance(tools, list) and tools:
+        return tools
+    return None
+
+
+def split_rendered_chat(rendered: str) -> list[dict[str, str]]:
+    messages = []
+    for segment in rendered.split(_IM_END):
+        segment = segment.lstrip("\n")
+        if not segment.strip():
+            continue
+
+        if not segment.startswith(_IM_START):
+            raise ValueError(f"Rendered chat segment does not start with {_IM_START!r}")
+
+        payload = segment[len(_IM_START):]
+        role, separator, content = payload.partition("\n")
+        if not separator:
+            raise ValueError("Rendered chat segment is missing role/content separator")
+
+        messages.append({"role": role.strip(), "content": content})
+
+    return messages
+
+
+def render_messages_for_sft(
+    messages: list[dict[str, Any]],
+    tokenizer,
+    tools: list[dict[str, Any]] | None = None,
+) -> list[dict[str, str]]:
+    rendered = tokenizer.apply_chat_template(
+        messages,
+        tools=tools,
+        tokenize=False,
+        add_generation_prompt=False,
+    )
+    if not isinstance(rendered, str):
+        raise ValueError("Tokenizer chat template must render to a string")
+    return split_rendered_chat(rendered)
+
+
+def convert_record_to_sft_messages(
+    record: dict[str, Any],
+    tokenizer,
+) -> list[dict[str, str]]:
+    converted = convert_record(record)
+    return render_messages_for_sft(
+        converted["messages"],
+        tokenizer,
+        tools=_record_tools(record),
+    )
+
+
 def _default_output_path(input_path: Path) -> Path:
     return input_path.with_name(f"{input_path.stem}_sft{input_path.suffix}")
 
 
-def convert_jsonl(input_path: Path, output_path: Path) -> int:
+def convert_jsonl(
+    input_path: Path,
+    output_path: Path,
+    tokenizer_name: str = DEFAULT_TOKENIZER,
+) -> int:
     converted_rows = 0
+    tokenizer = _load_tokenizer(tokenizer_name)
 
     with input_path.open(encoding="utf-8") as input_handle, output_path.open(
         "w", encoding="utf-8"
@@ -38,9 +116,7 @@ def convert_jsonl(input_path: Path, output_path: Path) -> int:
             if not isinstance(record, dict):
                 raise ValueError(f"{input_path}:{line_number}: row must decode to an object")
 
-            converted = convert_record(record)
-            row = dict(record)
-            row["messages"] = converted["messages"]
+            row = {"messages": convert_record_to_sft_messages(record, tokenizer)}
             output_handle.write(json.dumps(row, ensure_ascii=False) + "\n")
             converted_rows += 1
 
@@ -60,11 +136,16 @@ def main(argv=None):
         type=Path,
         help="Path to write the converted JSONL file (default: <input>_sft.jsonl)",
     )
+    parser.add_argument(
+        "--tokenizer",
+        default=DEFAULT_TOKENIZER,
+        help=f"Tokenizer chat template target (default: {DEFAULT_TOKENIZER})",
+    )
     args = parser.parse_args(argv)
 
     input_path = args.path_to_process
     output_path = args.output or _default_output_path(input_path)
-    converted_rows = convert_jsonl(input_path, output_path)
+    converted_rows = convert_jsonl(input_path, output_path, tokenizer_name=args.tokenizer)
     print(f"Wrote {converted_rows} converted rows to {output_path}")
     return 0
 
