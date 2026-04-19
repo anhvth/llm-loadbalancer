@@ -8,6 +8,7 @@ port:
 load-balancer:
   workers: 1
   worker-concurrency: 1024
+  routing: smart
   health-path: /v1/models
   log-dir: ~/.cache/llm-proxy/logs
   affinity-db: ~/.cache/llm-proxy/affinity.sqlite3

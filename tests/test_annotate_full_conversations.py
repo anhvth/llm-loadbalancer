@@ -1,13 +1,8 @@
-import importlib.util
 import json
 from pathlib import Path
 
 
-_MODULE_PATH = Path(__file__).resolve().parent.parent / "tools" / "annotate_full_conversations.py"
-_SPEC = importlib.util.spec_from_file_location("annotate_full_conversations", _MODULE_PATH)
-assert _SPEC is not None and _SPEC.loader is not None
-annotate_full_conversations = importlib.util.module_from_spec(_SPEC)
-_SPEC.loader.exec_module(annotate_full_conversations)
+from llm_loadbalancer.tools import annotate_full_conversations
 
 
 def _system_message(billing_header: str, text: str = "You are helpful.") -> dict:

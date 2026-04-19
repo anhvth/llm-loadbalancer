@@ -65,6 +65,7 @@ FD_FALLBACK_SOFT_LIMIT = 1024
 MIN_LISTEN_BACKLOG = 4096
 MAX_LISTEN_BACKLOG = 65535
 LLM_PROXY_EFFECTIVE_WORKER_CONCURRENCY_ENV = "LLM_PROXY_EFFECTIVE_WORKER_CONCURRENCY"
+LLM_PROXY_ROUTING_ENV = "LLM_PROXY_ROUTING"
 
 logger.remove()
 
@@ -819,7 +820,8 @@ class LoadBalancerApp:
             await response.aclose()
 
         await send({"type": "http.response.body", "body": b"", "more_body": False})
-        self._remember_messages_affinity(request_body, upstream_port)
+        if self.cfg.load_balancer_routing == "smart":
+            self._remember_messages_affinity(request_body, upstream_port)
         self._log_exchange(
             request_body,
             bytes(response_chunks),
@@ -870,9 +872,10 @@ class LoadBalancerApp:
         valid_endpoints: list[EndpointCheckResult],
     ) -> tuple[int, str]:
         valid_ports = {endpoint.port for endpoint in valid_endpoints}
-        affinity_port = self._find_messages_affinity_port(request_body)
-        if affinity_port is not None and affinity_port in valid_ports:
-            return affinity_port, "affinity"
+        if self.cfg.load_balancer_routing == "smart":
+            affinity_port = self._find_messages_affinity_port(request_body)
+            if affinity_port is not None and affinity_port in valid_ports:
+                return affinity_port, "affinity"
         return random.choice(list(valid_ports)), "random"
 
     def _find_messages_affinity_port(self, request_body: bytes) -> int | None:
@@ -1143,6 +1146,9 @@ def resolve_config_path(config_path: pathlib.Path | None = None) -> pathlib.Path
 
 def create_app(config_path: pathlib.Path | None = None, verbose: bool | None = None) -> LoadBalancerApp:
     cfg = parse_config(resolve_config_path(config_path))
+    routing = os.environ.get(LLM_PROXY_ROUTING_ENV)
+    if routing is not None:
+        cfg = dataclasses.replace(cfg, load_balancer_routing=routing)
     if verbose is None:
         verbose = os.environ.get("LLM_PROXY_VERBOSE", "0") == "1"
     return LoadBalancerApp(cfg, verbose=verbose)
@@ -1151,11 +1157,20 @@ def create_app(config_path: pathlib.Path | None = None, verbose: bool | None = N
 def serve_forever(
     config_path: pathlib.Path = pathlib.Path("~/.config/llm-proxy.yaml").expanduser(),
     verbose: bool = True,
+    routing: str | None = None,
 ) -> None:
     cfg = parse_config(config_path)
+    if routing is not None:
+        cfg = dataclasses.replace(cfg, load_balancer_routing=routing)
     fd_plan = plan_file_descriptor_limits(cfg)
+    previous_routing = os.environ.get(LLM_PROXY_ROUTING_ENV)
+    had_previous_routing = LLM_PROXY_ROUTING_ENV in os.environ
     os.environ["LLM_PROXY_CONFIG"] = str(config_path)
     os.environ["LLM_PROXY_VERBOSE"] = "1" if verbose else "0"
+    if routing is None:
+        os.environ.pop(LLM_PROXY_ROUTING_ENV, None)
+    else:
+        os.environ[LLM_PROXY_ROUTING_ENV] = cfg.load_balancer_routing
     os.environ[LLM_PROXY_EFFECTIVE_WORKER_CONCURRENCY_ENV] = str(
         fd_plan.effective_worker_concurrency
     )
@@ -1174,21 +1189,28 @@ def serve_forever(
             fd_plan.hard_limit if fd_plan.hard_limit is not None else "unknown",
             fd_plan.required_soft_limit,
         )
-    uvicorn.run(
-        "load_balancer:create_app",
-        factory=True,
-        host="127.0.0.1",
-        port=cfg.listen_port,
-        workers=cfg.load_balancer_workers,
-        limit_concurrency=fd_plan.effective_worker_concurrency,
-        backlog=listen_backlog_for_worker_concurrency(
-            cfg,
-            fd_plan.effective_worker_concurrency,
-        ),
-        timeout_keep_alive=30,
-        access_log=False,
-        log_level="info",
-    )
+    try:
+        uvicorn.run(
+            "load_balancer:create_app",
+            factory=True,
+            host="127.0.0.1",
+            port=cfg.listen_port,
+            workers=cfg.load_balancer_workers,
+            limit_concurrency=fd_plan.effective_worker_concurrency,
+            backlog=listen_backlog_for_worker_concurrency(
+                cfg,
+                fd_plan.effective_worker_concurrency,
+            ),
+            timeout_keep_alive=30,
+            access_log=False,
+            log_level="info",
+        )
+    finally:
+        if had_previous_routing:
+            assert previous_routing is not None
+            os.environ[LLM_PROXY_ROUTING_ENV] = previous_routing
+        else:
+            os.environ.pop(LLM_PROXY_ROUTING_ENV, None)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -1206,9 +1228,14 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="Disable verbose logging to terminal",
     )
+    parser.add_argument(
+        "--routing",
+        choices=("random", "smart"),
+        help="Routing mode. random disables message affinity; smart keeps affinity.",
+    )
     args = parser.parse_args(argv)
     verbose = not args.silent and os.environ.get("LLM_PROXY_VERBOSE", "1") == "1"
-    serve_forever(args.config, verbose=verbose)
+    serve_forever(args.config, verbose=verbose, routing=args.routing)
     return 0
 
 

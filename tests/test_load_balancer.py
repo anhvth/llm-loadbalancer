@@ -1080,6 +1080,45 @@ def test_choose_upstream_uses_request_endpoint_snapshot(tmp_path: Path, monkeypa
     assert route_reason == "affinity"
 
 
+def test_random_routing_ignores_messages_affinity(tmp_path: Path, monkeypatch):
+    config_path = tmp_path / "config.yaml"
+    upstream_ports = find_free_port_block(2)
+    write_config(config_path, upstream_ports, 8001)
+    config_path.write_text(config_path.read_text() + "  routing: random\n")
+
+    monkeypatch.setattr(
+        load_balancer.LoadBalancerApp,
+        "_initial_healthcheck",
+        lambda self: [
+            load_balancer.EndpointCheckResult(host=host, port=port)
+            for host, port in self.upstream_endpoints
+        ],
+    )
+    monkeypatch.setattr(load_balancer.random, "choice", lambda values: max(values))
+    app = create_app(config_path)
+    request_body = json.dumps(
+        {"model": "demo", "messages": [{"role": "user", "content": "hi"}]}
+    ).encode("utf-8")
+    app._remember_messages_affinity(request_body, upstream_ports[0])
+
+    upstream_port, route_reason = app._choose_upstream_port(
+        json.dumps(
+            {
+                "model": "demo",
+                "messages": [
+                    {"role": "user", "content": "hi"},
+                    {"role": "assistant", "content": "hello"},
+                    {"role": "user", "content": "tell me more"},
+                ],
+            }
+        ).encode("utf-8"),
+        list(app.valid_endpoints),
+    )
+
+    assert upstream_port == max(upstream_ports)
+    assert route_reason == "random"
+
+
 def test_sqlite_affinity_store_retries_transient_init_lock(tmp_path: Path, monkeypatch):
     class FakeConnection:
         def __init__(self):
@@ -1209,6 +1248,18 @@ def test_parse_config_resolves_default_db_path_relative_to_config(tmp_path: Path
 
     assert cfg.load_balancer_log_dir == Path("~/.cache/llm-proxy/logs").expanduser()
     assert cfg.load_balancer_affinity_db_path == Path("~/.cache/llm-proxy/affinity.sqlite3").expanduser()
+    assert cfg.load_balancer_routing == "smart"
+
+
+def test_parse_config_supports_random_routing(tmp_path: Path):
+    config_path = tmp_path / "config.yaml"
+    upstream_ports = find_free_port_block(1)
+    write_config(config_path, upstream_ports, 8001)
+    config_path.write_text(config_path.read_text() + "  routing: random\n")
+
+    cfg = parse_config(config_path)
+
+    assert cfg.load_balancer_routing == "random"
 
 
 def test_listen_backlog_scales_with_total_concurrency(tmp_path: Path):

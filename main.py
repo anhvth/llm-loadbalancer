@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import os
 import pathlib
 import subprocess
@@ -31,6 +32,7 @@ port:
 load-balancer:
   workers: 4
   worker-concurrency: 10204
+  routing: smart
   health-path: /models
   log-dir: ~/.cache/llm-proxy/logs
   affinity-db: ~/.cache/llm-proxy/affinity.sqlite3
@@ -87,6 +89,7 @@ def format_config_table(config_path: pathlib.Path, cfg) -> str:
         ("ssh-options", " ".join(cfg.ssh_options) if cfg.ssh_options else "-"),
         ("lb-workers", str(cfg.load_balancer_workers)),
         ("lb-worker-concurrency", str(cfg.load_balancer_worker_concurrency)),
+        ("lb-routing", cfg.load_balancer_routing),
         ("lb-health-path", cfg.load_balancer_health_path),
         ("lb-log-dir", str(cfg.load_balancer_log_dir)),
         ("lb-affinity-db", str(cfg.load_balancer_affinity_db_path)),
@@ -106,9 +109,15 @@ def format_config_table(config_path: pathlib.Path, cfg) -> str:
     return "\n".join(lines)
 
 
-def start_everything(config_path: pathlib.Path, verbose: bool = False) -> int:
+def start_everything(
+    config_path: pathlib.Path,
+    verbose: bool = False,
+    routing: str | None = None,
+) -> int:
     ensure_config_exists(config_path)
     cfg = parse_config(config_path)
+    if routing is not None:
+        cfg = dataclasses.replace(cfg, load_balancer_routing=routing)
     logger.info("Using config file: {}", config_path)
     logger.info("Loaded config:\n{}", format_config_table(config_path, cfg))
     commands = list(iter_commands(cfg))
@@ -117,7 +126,10 @@ def start_everything(config_path: pathlib.Path, verbose: bool = False) -> int:
         logger.info("Started SSH tunnels in tmux session: {}", cfg.tmux_session_name)
     else:
         logger.info("Using direct upstream connections; skipping SSH tunnel startup")
-    serve_forever(config_path, verbose=verbose)
+    if routing is None:
+        serve_forever(config_path, verbose=verbose)
+    else:
+        serve_forever(config_path, verbose=verbose, routing=routing)
     return 0
 
 
@@ -141,6 +153,11 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Suppress printing JSON request/response files to the local cache directory",
     )
+    parser.add_argument(
+        "--routing",
+        choices=("random", "smart"),
+        help="Routing mode. random disables message affinity; smart keeps affinity.",
+    )
     return parser
 
 
@@ -152,7 +169,9 @@ def main(argv: list[str] | None = None) -> int:
         return open_config_in_editor(args.config)
 
     try:
-        return start_everything(args.config, verbose=not args.silent)
+        if args.routing is None:
+            return start_everything(args.config, verbose=not args.silent)
+        return start_everything(args.config, verbose=not args.silent, routing=args.routing)
     except KeyboardInterrupt:
         return 130
 

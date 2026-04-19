@@ -1,17 +1,12 @@
 import json
 import sqlite3
 from pathlib import Path
-import sys
 
 import pytest
 
-ROOT = Path(__file__).resolve().parent.parent
-if str(ROOT) not in sys.path:
-    sys.path.insert(0, str(ROOT))
-
 import cat_db
 import load_balancer_v2
-from tools import collect_jsonl
+from llm_loadbalancer.tools import collect_jsonl
 
 
 def write_v2_config(config_path: Path, state_db_path: Path, upstream_ports: list[int]) -> None:
@@ -323,7 +318,7 @@ def test_collect_jsonl_exports_pending_v2_rows_incrementally(monkeypatch, tmp_pa
             ]
         )
 
-        export_path = export_dir / f"{collect_jsonl.time.strftime('%Y-%m-%d')}.jsonl"
+        export_path = export_dir / "collected.jsonl"
         lines = export_path.read_text(encoding="utf-8").splitlines()
         row = json.loads(lines[0])
 

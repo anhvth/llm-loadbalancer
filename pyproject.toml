@@ -17,6 +17,8 @@ dependencies = [
 [project.scripts]
 cat_db = "cat_db:main"
 llm-proxy = "main:main"
+collect-jsonl = "llm_loadbalancer.tools.collect_jsonl:main"
+annotate-full-conversations = "llm_loadbalancer.tools.annotate_full_conversations:main"
 
 [build-system]
 requires = ["hatchling"]
@@ -34,7 +36,16 @@ only-include = [
     "main.py",
     "keep_connection.py",
     "load_balancer.py",
+    "load_balancer_v2.py",
+    "src/llm_loadbalancer/__init__.py",
+    "src/llm_loadbalancer/tools/__init__.py",
+    "src/llm_loadbalancer/tools/collect_jsonl.py",
+    "src/llm_loadbalancer/tools/annotate_full_conversations.py",
+    "src/llm_loadbalancer/tools/convert_anthropic_messages_to_sft.py",
 ]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
 
 [dependency-groups]
 dev = [

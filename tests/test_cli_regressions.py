@@ -104,6 +104,22 @@ def test_main_passes_silent_flag_to_start_everything(monkeypatch, tmp_path):
     assert seen == [(config_path, False)]
 
 
+def test_main_passes_routing_override_to_start_everything(monkeypatch, tmp_path):
+    config_path = tmp_path / "config.yaml"
+    seen = []
+
+    def fake_start_everything(path, verbose=False, routing=None):
+        seen.append((path, verbose, routing))
+        return 0
+
+    monkeypatch.setattr(main, "start_everything", fake_start_everything)
+
+    result = main.main(["--config", str(config_path), "--routing", "random"])
+
+    assert result == 0
+    assert seen == [(config_path, True, "random")]
+
+
 def test_start_everything_launches_tmux_before_load_balancer(monkeypatch, tmp_path):
     config_path = tmp_path / "config.yaml"
     config_path.write_text(main.DEFAULT_CONFIG)
@@ -127,6 +143,24 @@ def test_start_everything_launches_tmux_before_load_balancer(monkeypatch, tmp_pa
     assert len(call_order[0][2]) == 7
     assert call_order[0][2][0][5] == "18001:localhost:8000"
     assert call_order[0][2][1][5] == "18002:localhost:8000"
+
+
+def test_start_everything_passes_routing_override_to_load_balancer(monkeypatch, tmp_path):
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(main.DEFAULT_CONFIG)
+    seen = []
+
+    monkeypatch.setattr(main, "launch_in_tmux", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        main,
+        "serve_forever",
+        lambda path, verbose=False, routing=None: seen.append((path, verbose, routing)),
+    )
+
+    result = main.start_everything(config_path, routing="random")
+
+    assert result == 0
+    assert seen == [(config_path, False, "random")]
 
 
 def test_start_everything_skips_tmux_for_direct_setup(monkeypatch, tmp_path):

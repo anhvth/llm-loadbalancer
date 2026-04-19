@@ -1,13 +1,8 @@
-import importlib.util
 import json
 from pathlib import Path
 
 
-_MODULE_PATH = Path(__file__).resolve().parent.parent / "tools" / "collect_jsonl.py"
-_SPEC = importlib.util.spec_from_file_location("collect_jsonl", _MODULE_PATH)
-assert _SPEC is not None and _SPEC.loader is not None
-collect_jsonl = importlib.util.module_from_spec(_SPEC)
-_SPEC.loader.exec_module(collect_jsonl)
+from llm_loadbalancer.tools import collect_jsonl
 
 
 def _payload_with_messages() -> dict:
@@ -33,10 +28,11 @@ def test_convert_file_exports_id_timestamp_input_output(tmp_path: Path):
     status, _, payload = collect_jsonl._convert_file(str(sample))
 
     assert status == "ok"
-    assert payload is not None
+    assert isinstance(payload, str)
     row = json.loads(payload)
     assert set(row.keys()) == {"id", "timestamp", "input", "output"}
     assert row["id"] == "my-request-001"
+    assert row["timestamp"] is not None
     assert row["input"]["messages"][0]["role"] == "user"
     assert row["output"]["content"][0]["text"] == "a.txt and b.txt"
     # No top-level SFT keys
@@ -64,6 +60,7 @@ def test_convert_file_bare_payload_with_messages(tmp_path: Path):
     status, _, payload = collect_jsonl._convert_file(str(sample))
 
     assert status == "ok"
+    assert isinstance(payload, str)
     row = json.loads(payload)
     assert row["input"] == bare
     assert row["output"] is None

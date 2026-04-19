@@ -51,6 +51,7 @@ class TunnelConfig:
     listen_port: int = 8001
     load_balancer_workers: int = 20
     load_balancer_worker_concurrency: int = 512
+    load_balancer_routing: str = "smart"
     load_balancer_health_path: str = "/models"
     load_balancer_log_dir: pathlib.Path = pathlib.Path("~/.cache/llm-proxy/logs").expanduser()
     load_balancer_affinity_db_path: pathlib.Path = pathlib.Path(
@@ -220,6 +221,11 @@ def parse_config(path: pathlib.Path) -> TunnelConfig:
     listen_port = int(ports[0]) if ports else int(merged.get("listen-port", "8001"))
     load_balancer_workers = int(load_balancer.get("workers", "20"))
     load_balancer_worker_concurrency = int(load_balancer.get("worker-concurrency", "512"))
+    load_balancer_routing = _strip_wrapping_quotes(load_balancer.get("routing", "smart")).lower()
+    if load_balancer_routing not in {"random", "smart"}:
+        raise ValueError(
+            f"Unsupported load-balancer.routing value: {load_balancer_routing!r}"
+        )
     load_balancer_health_path = load_balancer.get("health-path", "/models")
     if not load_balancer_health_path.startswith("/"):
         load_balancer_health_path = f"/{load_balancer_health_path}"
@@ -248,6 +254,7 @@ def parse_config(path: pathlib.Path) -> TunnelConfig:
         listen_port=listen_port,
         load_balancer_workers=load_balancer_workers,
         load_balancer_worker_concurrency=load_balancer_worker_concurrency,
+        load_balancer_routing=load_balancer_routing,
         load_balancer_health_path=load_balancer_health_path,
         load_balancer_log_dir=load_balancer_log_dir,
         load_balancer_affinity_db_path=load_balancer_affinity_db_path,
