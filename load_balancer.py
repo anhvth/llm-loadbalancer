@@ -17,6 +17,7 @@ import sqlite3
 import sys
 import threading
 import time
+import urllib.parse
 from typing import Any
 import uuid
 
@@ -242,12 +243,22 @@ class AsyncFileLogWriter:
                 self._queue.task_done()
 
     def _write_payload(self, payload: dict[str, Any]) -> pathlib.Path:
-        file_name = f"{time.time_ns()}-{os.getpid()}-{uuid.uuid4().hex}.json"
+        endpoint_slug = self._endpoint_slug(payload.get("endpoint_used"))
+        file_name = f"{time.time_ns()}-{os.getpid()}-ep_{endpoint_slug}-{uuid.uuid4().hex}.json"
         final_path = self.requests_dir / file_name
         tmp_path = final_path.with_suffix(".tmp")
         tmp_path.write_text(json.dumps(payload), encoding="utf-8")
         tmp_path.replace(final_path)
         return final_path
+
+    def _endpoint_slug(self, endpoint_used: Any) -> str:
+        if not isinstance(endpoint_used, str) or not endpoint_used:
+            return "unknown"
+        parsed = urllib.parse.urlparse(endpoint_used)
+        path = parsed.path or endpoint_used
+        raw_slug = path.strip("/").replace("/", "_") or "root"
+        normalized = "".join(ch if ch.isalnum() else "_" for ch in raw_slug).strip("_")
+        return normalized or "unknown"
 
     def _print_logged_payload(self, path: pathlib.Path, payload: dict[str, Any]) -> None:
         now = time.monotonic()

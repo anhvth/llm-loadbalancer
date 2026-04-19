@@ -10,6 +10,7 @@ import time
 from contextlib import contextmanager
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from typing import cast
 
 import httpx
 import pytest
@@ -529,7 +530,7 @@ def test_check_endpoint_sync_retries_transient_connection_errors(monkeypatch):
     monkeypatch.setattr(load_balancer, "HEALTHCHECK_CONNECT_RETRIES", 1)
     monkeypatch.setattr(load_balancer, "HEALTHCHECK_CONNECT_RETRY_DELAY_SECONDS", 0.0)
 
-    result = app._check_endpoint_sync(object(), endpoint)
+    result = app._check_endpoint_sync(cast(httpx.Client, object()), endpoint)
 
     assert result.error is None
     assert result.models == ("model-a",)
@@ -553,7 +554,7 @@ def test_check_endpoint_async_retries_transient_connection_errors(monkeypatch):
     monkeypatch.setattr(load_balancer, "HEALTHCHECK_CONNECT_RETRIES", 1)
     monkeypatch.setattr(load_balancer, "HEALTHCHECK_CONNECT_RETRY_DELAY_SECONDS", 0.0)
 
-    result = asyncio.run(app._check_endpoint_async(object(), endpoint))
+    result = asyncio.run(app._check_endpoint_async(cast(httpx.AsyncClient, object()), endpoint))
 
     assert result.error is None
     assert result.models == ("model-a",)
@@ -713,6 +714,24 @@ def test_verbose_request_response_log_is_rate_limited(monkeypatch, tmp_path: Pat
     assert calls[1][0] == "[request_response_log] log_path {} endpoint={} route={}"
 
 
+def test_request_log_filename_encodes_endpoint_slug(tmp_path: Path):
+    writer = load_balancer.AsyncFileLogWriter(tmp_path, verbose=False)
+    writer.start()
+    writer.submit(
+        {
+            "input": {"messages": [{"role": "user", "content": "hi"}]},
+            "output": {"choices": []},
+            "endpoint_used": "http://127.0.0.1:18000/v1/messages",
+            "route_reason": "least_requests",
+        }
+    )
+    writer.close()
+
+    files = sorted((tmp_path / "requests").glob("*.json"))
+    assert len(files) == 1
+    assert "-ep_v1_messages-" in files[0].name
+
+
 def test_proxies_streaming_response(tmp_path: Path):
     config_path = tmp_path / "config.yaml"
     db_path = tmp_path / "request_logs"
@@ -779,6 +798,61 @@ def test_logs_streaming_messages_as_final_json_shape(tmp_path: Path):
             f"http://127.0.0.1:{upstream_ports[0]}/v1/messages",
         )
     ]
+
+
+def test_does_not_log_prompt_only_requests(tmp_path: Path):
+    config_path = tmp_path / "config.yaml"
+    db_path = tmp_path / "request_logs"
+    upstream_ports = find_free_port_block(1)
+    write_config(config_path, upstream_ports, 8001)
+    config_path.write_text(config_path.read_text() + f"  log-dir: {db_path}\n")
+    request_payload = {
+        "model": "demo-model",
+        "prompt": "hello",
+        "max_tokens": 5,
+    }
+
+    with run_stub_server(upstream_ports[0]), run_load_balancer(config_path) as listen_port:
+        conn = http.client.HTTPConnection("127.0.0.1", listen_port, timeout=30)
+        conn.request(
+            "POST",
+            "/v1/completions",
+            body=json.dumps(request_payload),
+            headers={"Content-Type": "application/json"},
+        )
+        response = conn.getresponse()
+        response.read()
+        conn.close()
+
+    assert response.status == 200
+    assert read_log_rows(db_path) == []
+
+
+def test_does_not_log_requests_with_empty_messages(tmp_path: Path):
+    config_path = tmp_path / "config.yaml"
+    db_path = tmp_path / "request_logs"
+    upstream_ports = find_free_port_block(1)
+    write_config(config_path, upstream_ports, 8001)
+    config_path.write_text(config_path.read_text() + f"  log-dir: {db_path}\n")
+    request_payload = {
+        "model": "demo-model",
+        "messages": [],
+    }
+
+    with run_stub_server(upstream_ports[0]), run_load_balancer(config_path) as listen_port:
+        conn = http.client.HTTPConnection("127.0.0.1", listen_port, timeout=30)
+        conn.request(
+            "POST",
+            "/v1/chat/completions",
+            body=json.dumps(request_payload),
+            headers={"Content-Type": "application/json"},
+        )
+        response = conn.getresponse()
+        response.read()
+        conn.close()
+
+    assert response.status == 200
+    assert read_log_rows(db_path) == []
 
 
 def test_reuses_backend_for_matching_messages_prefix(tmp_path: Path):

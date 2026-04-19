@@ -1,0 +1,297 @@
+#!/usr/bin/env python3
+"""Collect request/response JSON files and convert them to ShareGPT JSONL format."""
+
+import argparse
+import json
+import logging
+import shutil
+import sys
+import time
+from pathlib import Path
+
+logger = logging.getLogger("collect_jsonl")
+
+
+def convert_to_sharegpt(
+    payload: dict,
+    system_prompt: str | None = None,
+    min_messages: int = 1,
+) -> dict | None:
+    """
+    Convert a logged payload to ShareGPT/LlamaFactory format.
+
+    Input payload:
+        {
+            "input": {"model": "...", "messages": [{"role": "...", "content": "..."}]},
+            "output": {"choices": [{"message": {"role": "assistant", "content": "..."}}]},
+            ...
+        }
+
+    Returns:
+        {"messages": [{"role": "...", "content": [...]}, ...]}
+        or None if conversion fails.
+    """
+    try:
+        input_val = payload.get("input")
+
+        # Handle case where input is a raw string (invalid JSON stored as text)
+        if isinstance(input_val, str):
+            return None
+
+        if not isinstance(input_val, dict) or not input_val:
+            return None
+
+        input_msgs = input_val.get("messages", [])
+        if not isinstance(input_msgs, list) or len(input_msgs) < min_messages:
+            return None
+
+        sharegpt_messages = []
+
+        if system_prompt:
+            sharegpt_messages.append({
+                "role": "system",
+                "content": [{"type": "text", "value": system_prompt}]
+            })
+
+        for msg in input_msgs:
+            role = msg.get("role", "unknown")
+            content = msg.get("content", "")
+            if isinstance(content, list):
+                normalized = []
+                for block in content:
+                    if not isinstance(block, dict):
+                        continue
+                    block_type = block.get("type", "text")
+                    if block_type == "text":
+                        normalized.append({
+                            "type": "text",
+                            "value": block.get("text", block.get("value", "")),
+                        })
+                    elif block_type in ("reasoning", "thinking"):
+                        normalized.append({
+                            "type": "reasoning",
+                            "value": block.get("reasoning") or block.get("thinking") or block.get("value", ""),
+                        })
+                    elif block_type == "tool_call":
+                        normalized.append({
+                            "type": "tool_call",
+                            "name": block.get("name", ""),
+                            "arguments": block.get("arguments", {}),
+                        })
+                    elif block_type == "tool_use":
+                        tool_name = block.get("name", "unknown_tool")
+                        tool_input = block.get("input", {})
+                        normalized.append({
+                            "type": "tool_call",
+                            "name": tool_name,
+                            "arguments": tool_input,
+                        })
+                    elif block_type == "tool_result":
+                        tool_content = block.get("content", "")
+                        normalized.append({
+                            "type": "tool",
+                            "content": [{"type": "text", "value": str(tool_content)}],
+                        })
+                    # Skip cache_control and other metadata blocks
+                sharegpt_messages.append({"role": role, "content": normalized})
+            elif content:
+                sharegpt_messages.append({
+                    "role": role,
+                    "content": [{"type": "text", "value": str(content)}]
+                })
+
+        output = payload.get("output", {})
+        if isinstance(output, dict):
+            # Try OpenAI format: output.choices[0].message
+            choices = output.get("choices", [])
+            if choices:
+                assistant_msg = choices[0].get("message", {})
+                role = assistant_msg.get("role", "assistant")
+                content = assistant_msg.get("content", "")
+            else:
+                # Try direct format: output.content (e.g. MiniMax)
+                role = "assistant"
+                content = output.get("content", "")
+
+            if content:
+                if isinstance(content, list):
+                    # Normalize output content blocks (same as input)
+                    normalized = []
+                    for block in content:
+                        if not isinstance(block, dict):
+                            continue
+                        block_type = block.get("type", "text")
+                        if block_type == "text":
+                            normalized.append({
+                                "type": "text",
+                                "value": block.get("text", block.get("value", "")),
+                            })
+                        elif block_type in ("reasoning", "thinking"):
+                            normalized.append({
+                                "type": "reasoning",
+                                "value": block.get("reasoning") or block.get("thinking") or block.get("value", ""),
+                            })
+                        elif block_type == "tool_call":
+                            normalized.append({
+                                "type": "tool_call",
+                                "name": block.get("name", ""),
+                                "arguments": block.get("arguments", {}),
+                            })
+                        elif block_type == "tool_use":
+                            # Anthropic tool_use format
+                            tool_name = block.get("name", "unknown_tool")
+                            tool_input = block.get("input", {})
+                            normalized.append({
+                                "type": "tool_call",
+                                "name": tool_name,
+                                "arguments": tool_input,
+                            })
+                        elif block_type == "tool":
+                            normalized.append({
+                                "type": "tool",
+                                "content": [{"type": "text", "value": str(block.get("content", ""))}],
+                            })
+                    # Always append if we have content, even if partial
+                    if normalized:
+                        sharegpt_messages.append({"role": role, "content": normalized})
+                    elif content:
+                        # All blocks were skipped (unknown types) — include raw text
+                        raw_text = " ".join(
+                            str(b.get("text", "")) or str(b.get("thinking", "")) or str(b.get("name", "")) or ""
+                            for b in content if isinstance(b, dict)
+                        ).strip()
+                        if raw_text:
+                            sharegpt_messages.append({
+                                "role": role,
+                                "content": [{"type": "text", "value": raw_text}],
+                            })
+                else:
+                    sharegpt_messages.append({
+                        "role": role,
+                        "content": [{"type": "text", "value": str(content)}]
+                    })
+
+        return {"messages": sharegpt_messages}
+
+    except Exception:
+        return None
+
+
+def _collect(
+    requests_dir: Path,
+    export_dir: Path,
+    processed_dir: Path | None,
+    system_prompt: str | None,
+    dry_run: bool = False,
+    min_messages: int = 1,
+) -> tuple[int, int]:
+    """
+    Collect and convert all .json files from requests_dir.
+
+    Returns:
+        (collected_count, skipped_count)
+    """
+    requests_dir.mkdir(parents=True, exist_ok=True)
+    export_dir.mkdir(parents=True, exist_ok=True)
+    if processed_dir:
+        processed_dir.mkdir(parents=True, exist_ok=True)
+
+    today = time.strftime("%Y-%m-%d")
+    export_path = export_dir / f"{today}.jsonl"
+
+    collected = 0
+    skipped = 0
+
+    for json_file in sorted(requests_dir.glob("*.json")):
+        try:
+            payload = json.loads(json_file.read_text(encoding="utf-8"))
+        except Exception as e:
+            logger.debug("Skipping unreadable file %s: %s", json_file.name, e)
+            skipped += 1
+            continue
+
+        sharegpt = convert_to_sharegpt(payload, system_prompt, min_messages)
+        if sharegpt is None:
+            skipped += 1
+            continue
+
+        if dry_run:
+            logger.info("[DRY RUN] Would write to %s: %s", export_path, json.dumps(sharegpt))
+        else:
+            with export_path.open("a", encoding="utf-8") as f:
+                f.write(json.dumps(sharegpt, ensure_ascii=False) + "\n")
+
+        if processed_dir and not dry_run:
+            shutil.move(str(json_file), str(processed_dir / json_file.name))
+        elif not dry_run:
+            json_file.unlink()
+
+        collected += 1
+
+    return collected, skipped
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Collect request logs and export to ShareGPT JSONL")
+    parser.add_argument(
+        "--requests-dir",
+        type=Path,
+        default=Path("~/.cache/llm-proxy/logs/requests").expanduser(),
+        help="Directory containing raw .json request files",
+    )
+    parser.add_argument(
+        "--export-dir",
+        type=Path,
+        default=Path("~/.cache/llm-proxy/training-data").expanduser(),
+        help="Directory to write JSONL output files",
+    )
+    parser.add_argument(
+        "--processed-dir",
+        type=Path,
+        help="Directory to move processed files (default: delete after export)",
+    )
+    parser.add_argument(
+        "--system-prompt",
+        type=str,
+        default=None,
+        help="Optional system prompt to prepend to each conversation",
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Parse and log conversions without writing files or deleting sources",
+    )
+    parser.add_argument(
+        "--log-level",
+        default="INFO",
+        choices=["DEBUG", "INFO", "WARNING", "ERROR"],
+        help="Log level",
+    )
+    parser.add_argument(
+        "--min-messages",
+        type=int,
+        default=2,
+        help="Minimum number of messages in input to consider for export (default: 2, meaning at least a user message)",
+    )
+    args = parser.parse_args()
+
+    logging.basicConfig(
+        level=getattr(logging, args.log_level),
+        format="%(asctime)s %(levelname)s %(message)s",
+    )
+
+    collected, skipped = _collect(
+        args.requests_dir,
+        args.export_dir,
+        args.processed_dir,
+        args.system_prompt,
+        args.dry_run,
+        args.min_messages,
+    )
+
+    logger.info("Collected %d entries (%d skipped) to %s", collected, skipped, args.export_dir)
+    sys.exit(0)
+
+
+if __name__ == "__main__":
+    main()
