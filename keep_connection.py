@@ -56,6 +56,9 @@ class TunnelConfig:
     load_balancer_affinity_db_path: pathlib.Path = pathlib.Path(
         "~/.cache/llm-proxy/affinity.sqlite3"
     ).expanduser()
+    load_balancer_state_db_path: pathlib.Path = pathlib.Path(
+        "~/.cache/llm-proxy/state.sqlite3"
+    ).expanduser()
     user: str | None = None
     ssh_options: list[str] = dataclasses.field(default_factory=list)
     tmux_session_name: str = "keepssh"
@@ -228,6 +231,10 @@ def parse_config(path: pathlib.Path) -> TunnelConfig:
         path,
         load_balancer.get("affinity-db", "~/.cache/llm-proxy/affinity.sqlite3")
     )
+    load_balancer_state_db_path = resolve_config_relative_path(
+        path,
+        load_balancer.get("state-db", "~/.cache/llm-proxy/state.sqlite3")
+    )
     user = merged.get("user")
     ssh_options = shlex.split(merged.get("ssh-options", ""))
     tmux_session_name = tmux.get("session-name", "keepssh")
@@ -244,6 +251,7 @@ def parse_config(path: pathlib.Path) -> TunnelConfig:
         load_balancer_health_path=load_balancer_health_path,
         load_balancer_log_dir=load_balancer_log_dir,
         load_balancer_affinity_db_path=load_balancer_affinity_db_path,
+        load_balancer_state_db_path=load_balancer_state_db_path,
         user=user,
         ssh_options=ssh_options,
         tmux_session_name=tmux_session_name,

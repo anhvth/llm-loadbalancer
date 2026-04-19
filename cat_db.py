@@ -5,6 +5,7 @@ import fcntl
 import json
 import os
 import pathlib
+import sqlite3
 import sys
 import textwrap
 
@@ -17,6 +18,7 @@ except ImportError:  # pragma: no cover - not expected on Unix-like systems used
 
 
 REQUEST_LOGS_DIRNAME = "requests"
+STATE_DB_FILENAME = "state.sqlite3"
 
 
 def default_log_dir() -> pathlib.Path:
@@ -27,8 +29,13 @@ def default_log_dir() -> pathlib.Path:
         if config_path.exists():
             try:
                 for line in config_path.read_text().splitlines():
-                    if line.startswith("log-dir:"):
-                        log_dir = line.split("log-dir:", 1)[1].strip()
+                    stripped = line.strip()
+                    if stripped.startswith("state-db:"):
+                        state_db = stripped.split("state-db:", 1)[1].strip()
+                        if state_db:
+                            return pathlib.Path(state_db).expanduser()
+                    if stripped.startswith("log-dir:"):
+                        log_dir = stripped.split("log-dir:", 1)[1].strip()
                         if log_dir:
                             return pathlib.Path(log_dir).expanduser()
             except Exception:
@@ -50,21 +57,58 @@ def build_parser() -> argparse.ArgumentParser:
         nargs="?",
         type=pathlib.Path,
         default=default_log_dir(),
-        help="Path to the request log directory. Defaults to ~/.cache/llm-proxy/logs",
+        help="Path to the request log directory or v2 state database",
     )
     return parser
 
 
-def iter_rows(log_dir: pathlib.Path):
+def _encode_logged_value(value):
+    if isinstance(value, (dict, list)):
+        return json.dumps(value, ensure_ascii=False)
+    return str(value)
+
+
+def _iter_rows_from_files(log_dir: pathlib.Path):
     requests_dir = log_dir / REQUEST_LOGS_DIRNAME
     for index, path in enumerate(sorted(requests_dir.glob("*.json")), start=1):
         payload = json.loads(path.read_text(encoding="utf-8"))
         yield (
             index,
-            str(payload.get("input", "")),
-            str(payload.get("output", "")),
+            _encode_logged_value(payload.get("input", "")),
+            _encode_logged_value(payload.get("output", "")),
             str(payload.get("endpoint_used", "")),
         )
+
+
+def _iter_rows_from_state_db(state_db_path: pathlib.Path):
+    import load_balancer_v2
+
+    with load_balancer_v2.StateDbReader(state_db_path) as reader:
+        for record in reader.iter_requests():
+            yield (
+                record.request_id,
+                _encode_logged_value(record.input_payload),
+                _encode_logged_value(record.output_payload),
+                record.endpoint_used,
+            )
+
+
+def iter_rows(log_dir: pathlib.Path):
+    if log_dir.is_file():
+        yield from _iter_rows_from_state_db(log_dir)
+        return
+
+    requests_dir = log_dir / REQUEST_LOGS_DIRNAME
+    if requests_dir.exists():
+        yield from _iter_rows_from_files(log_dir)
+        return
+
+    state_db_path = log_dir / STATE_DB_FILENAME
+    if state_db_path.exists():
+        yield from _iter_rows_from_state_db(state_db_path)
+        return
+
+    yield from _iter_rows_from_files(log_dir)
 
 
 def parse_json_text(value: str):
@@ -221,7 +265,7 @@ def main(argv: list[str] | None = None) -> int:
 
     try:
         rows = list(iter_rows(args.log_dir))
-    except (OSError, json.JSONDecodeError) as exc:
+    except (OSError, json.JSONDecodeError, sqlite3.Error) as exc:
         print(f"Failed to read {args.log_dir}: {exc}", file=sys.stderr)
         return 1
 

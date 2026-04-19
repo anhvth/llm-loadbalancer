@@ -5,4 +5,4 @@ from tools.collect_jsonl import main
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

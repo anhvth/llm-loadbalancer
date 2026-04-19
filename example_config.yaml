@@ -6,8 +6,8 @@ port:
   - 8001
 
 load-balancer:
-  workers: 4
-  worker-concurrency: 10204
+  workers: 1
+  worker-concurrency: 1024
   health-path: /v1/models
   log-dir: ~/.cache/llm-proxy/logs
   affinity-db: ~/.cache/llm-proxy/affinity.sqlite3

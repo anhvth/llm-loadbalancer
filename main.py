@@ -34,6 +34,7 @@ load-balancer:
   health-path: /models
   log-dir: ~/.cache/llm-proxy/logs
   affinity-db: ~/.cache/llm-proxy/affinity.sqlite3
+  state-db: ~/.cache/llm-proxy/state.sqlite3
 
 port-start: 18001
 """
@@ -89,6 +90,7 @@ def format_config_table(config_path: pathlib.Path, cfg) -> str:
         ("lb-health-path", cfg.load_balancer_health_path),
         ("lb-log-dir", str(cfg.load_balancer_log_dir)),
         ("lb-affinity-db", str(cfg.load_balancer_affinity_db_path)),
+        ("lb-state-db", str(cfg.load_balancer_state_db_path)),
     ]
     key_width = max(len("key"), max(len(key) for key, _ in rows))
     value_width = max(len("value"), max(len(value) for _, value in rows))
