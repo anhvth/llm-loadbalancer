@@ -1,7 +1,13 @@
 #!/usr/bin/env python3
-"""Collect request logs and export Anthropic-format rows to SFT JSONL."""
+"""Collect request logs and export eligible rows to JSONL.
+
+Eligibility: the input payload must be a dict containing a top-level
+"messages" key.  Each exported row is a simple JSON object with
+id, timestamp, input, and output.  No SFT conversion is performed here.
+"""
 
 import argparse
+import datetime
 import glob
 import importlib.util
 import json
@@ -9,91 +15,28 @@ import logging
 import shutil
 import sys
 import time
-import urllib.parse
 from collections import Counter
 from pathlib import Path
 
 from tqdm import tqdm
 
-try:
-    from tools.convert_anthropic_messages_to_sft import anthropic_format_to_train_sft
-except ModuleNotFoundError:
-    _CONVERTER_PATH = Path(__file__).resolve().parent / "convert_anthropic_messages_to_sft.py"
-    _CONVERTER_SPEC = importlib.util.spec_from_file_location(
-        "convert_anthropic_messages_to_sft",
-        _CONVERTER_PATH,
-    )
-    assert _CONVERTER_SPEC is not None and _CONVERTER_SPEC.loader is not None
-    _converter_module = importlib.util.module_from_spec(_CONVERTER_SPEC)
-    sys.modules["convert_anthropic_messages_to_sft"] = _converter_module
-    _CONVERTER_SPEC.loader.exec_module(_converter_module)
-    anthropic_format_to_train_sft = _converter_module.anthropic_format_to_train_sft
-
 logger = logging.getLogger("collect_jsonl")
-_ENDPOINT_MARKER = "-ep_"
 
 
-def _extract_endpoint_slug_from_filename(path: Path) -> str | None:
-    stem = path.stem
-    marker_index = stem.find(_ENDPOINT_MARKER)
-    if marker_index < 0:
-        return None
-    start = marker_index + len(_ENDPOINT_MARKER)
-    end = stem.find("-", start)
-    if end < 0:
-        return None
-    slug = stem[start:end]
-    return slug or None
+def _has_messages(input_payload: object) -> bool:
+    """Return True if *input_payload* is a dict with a top-level 'messages' key."""
+    return isinstance(input_payload, dict) and "messages" in input_payload
 
 
-def _extract_endpoint_slug_from_endpoint_used(endpoint_used: object) -> str | None:
-    if not isinstance(endpoint_used, str) or not endpoint_used:
-        return None
-    parsed = urllib.parse.urlparse(endpoint_used)
-    path = parsed.path or endpoint_used
-    raw_slug = path.strip("/").replace("/", "_") or "root"
-    normalized = "".join(ch if ch.isalnum() else "_" for ch in raw_slug).strip("_")
-    return normalized or None
-
-
-def _is_anthropic_endpoint_slug(endpoint_slug: str | None) -> bool:
-    if endpoint_slug is None:
-        return False
-    return endpoint_slug == "v1_messages" or endpoint_slug.endswith("_v1_messages")
-
-
-def _convert_payload(
-    payload: dict[str, object],
-    endpoint_slug: str | None,
-    source_label: str,
-) -> tuple[str, str, str | None]:
-    if not _is_anthropic_endpoint_slug(endpoint_slug):
-        return (
-            "skip:unsupported_endpoint_format",
-            source_label,
-            f"endpoint_slug={endpoint_slug!r}",
-        )
-
-    try:
-        converted = anthropic_format_to_train_sft(payload)
-    except Exception as exc:
-        return ("skip:anthropic_convert_error", source_label, str(exc))
-
-    if not isinstance(converted, dict):
-        return ("skip:anthropic_convert_invalid", source_label, "converter returned non-dict")
-
-    messages = converted.get("messages")
-    if not isinstance(messages, list) or not messages:
-        return ("skip:anthropic_convert_empty_messages", source_label, "messages missing or empty")
-
-    tools = converted.get("tools", [])
-    if tools is None:
-        tools = []
-    if not isinstance(tools, list):
-        return ("skip:anthropic_convert_invalid_tools", source_label, "tools must be a list")
-
-    row = {"messages": messages, "tools": tools}
-    return ("ok", source_label, json.dumps(row, ensure_ascii=False))
+def _make_row(row_id: object, timestamp: str | None, input_payload: object, output_payload: object) -> str:
+    """Serialize an export row to a JSON string."""
+    row = {
+        "id": row_id,
+        "timestamp": timestamp,
+        "input": input_payload,
+        "output": output_payload,
+    }
+    return json.dumps(row, ensure_ascii=False)
 
 
 def _convert_file(json_path: str) -> tuple[str, str, str | None]:
@@ -103,11 +46,23 @@ def _convert_file(json_path: str) -> tuple[str, str, str | None]:
     except Exception as exc:
         return ("skip:unreadable_json", json_path, f"unreadable: {exc}")
 
-    return _convert_payload(
-        payload,
-        _extract_endpoint_slug_from_filename(path),
-        json_path,
-    )
+    if not isinstance(payload, dict):
+        return ("skip:not_a_dict", json_path, None)
+
+    # Support wrapped {"input": ..., "output": ...} or bare request payloads.
+    if "input" in payload and "output" in payload:
+        input_payload = payload["input"]
+        output_payload = payload["output"]
+    else:
+        input_payload = payload
+        output_payload = None
+
+    if not _has_messages(input_payload):
+        return ("skip:missing_messages", json_path, None)
+
+    row_id = path.stem
+    row_json = _make_row(row_id, None, input_payload, output_payload)
+    return ("ok", json_path, row_json)
 
 
 def _load_load_balancer_v2_module():
@@ -188,19 +143,18 @@ def _collect_state_db(
 
     with load_balancer_v2.StateDbReader(state_db) as reader:
         for record in reader.iter_requests(only_uncollected=True):
-            status, _, payload = _convert_payload(
-                {
-                    "input": record.input_payload,
-                    "output": record.output_payload,
-                    "endpoint_used": record.endpoint_used,
-                },
-                _extract_endpoint_slug_from_endpoint_used(record.endpoint_used),
-                f"{state_db}#{record.request_id}",
-            )
-            if status != "ok":
-                skip_reasons[status.removeprefix("skip:")] += 1
+            input_payload = record.input_payload
+            if not _has_messages(input_payload):
+                skip_reasons["missing_messages"] += 1
                 skipped += 1
                 continue
+
+            ts = datetime.datetime.fromtimestamp(
+                record.created_ns / 1e9, tz=datetime.timezone.utc
+            ).isoformat()
+            payload = _make_row(
+                record.request_id, ts, input_payload, record.output_payload
+            )
 
             if dry_run:
                 logger.info("[DRY RUN] Would write request %s to %s", record.request_id, export_path)
@@ -219,7 +173,7 @@ def _collect_state_db(
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="Collect request logs and export Anthropic-format SFT JSONL")
+    parser = argparse.ArgumentParser(description="Collect request logs and export eligible rows to JSONL")
     parser.add_argument(
         "--requests-dir",
         "--path-to-process",

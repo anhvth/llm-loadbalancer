@@ -10,74 +10,60 @@ collect_jsonl = importlib.util.module_from_spec(_SPEC)
 _SPEC.loader.exec_module(collect_jsonl)
 
 
-def _anthropic_payload() -> dict:
+def _payload_with_messages() -> dict:
+    """A wrapped payload whose input contains a top-level 'messages' key."""
     return {
         "input": {
-            "system": [{"type": "text", "text": "You are helpful."}],
             "messages": [
-                {
-                    "role": "user",
-                    "content": [{"type": "text", "text": "What files are in /tmp?"}],
-                },
-                {
-                    "role": "assistant",
-                    "content": [
-                        {"type": "thinking", "thinking": "I should inspect the directory."},
-                        {"type": "tool_use", "name": "ReadDir", "input": {"path": "/tmp"}},
-                    ],
-                },
-                {
-                    "role": "user",
-                    "content": [
-                        {
-                            "type": "tool_result",
-                            "tool_use_id": "call_1",
-                            "content": "a.txt\nb.txt",
-                            "is_error": False,
-                        }
-                    ],
-                },
-            ],
-            "tools": [
-                {
-                    "name": "ReadDir",
-                    "description": "List a directory",
-                    "input_schema": {
-                        "type": "object",
-                        "properties": {"path": {"type": "string"}},
-                        "required": ["path"],
-                    },
-                }
+                {"role": "user", "content": "What files are in /tmp?"},
             ],
         },
         "output": {
-            "content": [
-                {"type": "thinking", "thinking": "I can answer now."},
-                {"type": "text", "text": "The directory contains a.txt and b.txt."},
-            ]
+            "content": [{"type": "text", "text": "a.txt and b.txt"}],
         },
     }
 
 
-def test_convert_file_uses_anthropic_converter_when_endpoint_slug_is_v1_messages(tmp_path: Path):
-    sample = tmp_path / "1777000000000000000-12345-ep_v1_messages-abcdef.json"
-    sample.write_text(json.dumps(_anthropic_payload()), encoding="utf-8")
+def test_convert_file_exports_id_timestamp_input_output(tmp_path: Path):
+    """A file whose input has 'messages' should produce an eligible row
+    with id, timestamp, input, and output — no SFT conversion."""
+    sample = tmp_path / "my-request-001.json"
+    sample.write_text(json.dumps(_payload_with_messages()), encoding="utf-8")
 
     status, _, payload = collect_jsonl._convert_file(str(sample))
 
     assert status == "ok"
     assert payload is not None
     row = json.loads(payload)
-    assert isinstance(row["messages"], list)
-    assert isinstance(row["tools"], list)
-    assert row["tools"][0]["name"] == "ReadDir"
+    assert set(row.keys()) == {"id", "timestamp", "input", "output"}
+    assert row["id"] == "my-request-001"
+    assert row["input"]["messages"][0]["role"] == "user"
+    assert row["output"]["content"][0]["text"] == "a.txt and b.txt"
+    # No top-level SFT keys
+    assert "messages" not in row or row.get("messages") is None or isinstance(row.get("input"), dict)
+    assert "tools" not in row
 
 
-def test_convert_file_skips_non_anthropic_endpoint_slug(tmp_path: Path):
-    sample = tmp_path / "1777000000000000001-12345-ep_v1_chat_completions-fedcba.json"
-    sample.write_text(json.dumps(_anthropic_payload()), encoding="utf-8")
+def test_convert_file_skips_payload_without_messages(tmp_path: Path):
+    """A file whose input lacks 'messages' should be skipped."""
+    sample = tmp_path / "no-messages.json"
+    sample.write_text(json.dumps({"input": {"prompt": "hi"}, "output": {}}), encoding="utf-8")
 
-    status, _, reason = collect_jsonl._convert_file(str(sample))
+    status, _, _ = collect_jsonl._convert_file(str(sample))
 
-    assert status == "skip:unsupported_endpoint_format"
-    assert "v1_chat_completions" in str(reason)
+    assert status == "skip:missing_messages"
+
+
+def test_convert_file_bare_payload_with_messages(tmp_path: Path):
+    """A bare request payload (no input/output wrapper) with 'messages'
+    should be treated as input with output=None."""
+    sample = tmp_path / "bare.json"
+    bare = {"messages": [{"role": "user", "content": "hello"}], "model": "x"}
+    sample.write_text(json.dumps(bare), encoding="utf-8")
+
+    status, _, payload = collect_jsonl._convert_file(str(sample))
+
+    assert status == "ok"
+    row = json.loads(payload)
+    assert row["input"] == bare
+    assert row["output"] is None

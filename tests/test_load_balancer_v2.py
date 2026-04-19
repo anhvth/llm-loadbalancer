@@ -338,7 +338,9 @@ def test_collect_jsonl_exports_pending_v2_rows_incrementally(monkeypatch, tmp_pa
         assert result_first == 0
         assert result_second == 0
         assert len(lines) == 1
-        assert isinstance(row["messages"], list)
+        assert set(row.keys()) == {"id", "timestamp", "input", "output"}
+        assert row["input"]["messages"][0]["role"] == "user"
+        assert row["output"]["content"][-1]["text"] == "The directory contains a.txt and b.txt."
         assert collected_at_ns is not None
     finally:
         app.state_store.close()
