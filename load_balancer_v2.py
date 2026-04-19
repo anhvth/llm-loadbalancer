@@ -1476,110 +1476,321 @@ class LoadBalancerAppV2:
         except json.JSONDecodeError:
             return response_text
 
-    async def _handle_http(self, scope, receive, send) -> None:
-        valid_endpoints = list(self.valid_endpoints)
-        if not valid_endpoints:
-            await self._send_plain_error(send, 503, b"No upstream ports configured")
-            return
 
-        client = self.client or self._build_client()
-        method = scope["method"]
-        path = scope.get("raw_path", scope["path"].encode("utf-8")).decode("utf-8")
-        query_string = scope.get("query_string", b"")
-        if query_string:
-            path = f"{path}?{query_string.decode('latin1')}"
-
-        request_chunks = bytearray()
-        while True:
-            message = await receive()
-            if message["type"] != "http.request":
+    def _normalize_sse_payload(self, response_text: str) -> str | None:
+        parsed_events: list[dict[str, Any]] = []
+        for chunk in response_text.split("\n\n"):
+            chunk = chunk.strip()
+            if not chunk:
                 continue
-            body = message.get("body", b"")
-            if body:
-                request_chunks.extend(body)
-            if not message.get("more_body", False):
+            data_lines = [line[5:].lstrip() for line in chunk.splitlines() if line.startswith("data:")]
+            if not data_lines:
+                return None
+            payload = "\n".join(data_lines).strip()
+            if not payload or payload == "[DONE]":
+                continue
+            try:
+                parsed_events.append(json.loads(payload))
+            except json.JSONDecodeError:
+                return None
+
+        if not parsed_events:
+            return None
+
+        anthropic_payload = self._normalize_anthropic_stream(parsed_events)
+        if anthropic_payload is not None:
+            return anthropic_payload
+
+        openai_payload = self._normalize_openai_stream(parsed_events)
+        if openai_payload is not None:
+            return openai_payload
+
+        return None
+
+    def _normalize_anthropic_stream(self, events: list[dict[str, Any]]) -> str | None:
+        message: dict[str, Any] | None = None
+        content_blocks: list[dict[str, Any]] = []
+
+        for event in events:
+            event_type = event.get("type")
+            if event_type == "message_start":
+                raw_message = event.get("message")
+                if not isinstance(raw_message, dict):
+                    return None
+                message = dict(raw_message)
+                content_blocks = [dict(block) for block in raw_message.get("content", []) if isinstance(block, dict)]
+                message["content"] = content_blocks
+                continue
+
+            if message is None:
+                continue
+
+            if event_type == "content_block_start":
+                index = event.get("index")
+                block = event.get("content_block")
+                if not isinstance(index, int) or not isinstance(block, dict):
+                    return None
+                while len(content_blocks) <= index:
+                    content_blocks.append({})
+                content_blocks[index] = dict(block)
+                continue
+
+            if event_type == "content_block_delta":
+                index = event.get("index")
+                delta = event.get("delta")
+                if not isinstance(index, int) or not isinstance(delta, dict):
+                    return None
+                while len(content_blocks) <= index:
+                    content_blocks.append({})
+                block = content_blocks[index]
+                if not block and isinstance(event.get("content_block"), dict):
+                    block.update(event["content_block"])
+                for key, value in delta.items():
+                    if key == "type":
+                        continue
+                    if isinstance(value, str) and isinstance(block.get(key), str):
+                        block[key] += value
+                    else:
+                        block[key] = value
+                continue
+
+            if event_type == "message_delta":
+                delta = event.get("delta")
+                if isinstance(delta, dict):
+                    for key, value in delta.items():
+                        message[key] = value
+                usage = event.get("usage")
+                if isinstance(usage, dict):
+                    merged_usage = dict(message.get("usage", {}))
+                    merged_usage.update(usage)
+                    message["usage"] = merged_usage
+                continue
+
+            if event_type == "message_stop":
                 break
 
-        request_body = bytes(request_chunks)
-        prepared_request = self._prepare_request_state(request_body)
-        if prepared_request is not None:
-            upstream_port, route_reason, lookup = self._select_upstream_for_prepared_request(
-                prepared_request,
-                valid_endpoints,
-            )
-        else:
-            upstream_port = random.choice([endpoint.port for endpoint in valid_endpoints])
-            route_reason = "random"
-            lookup = None
+        if message is None:
+            return None
+        message["content"] = content_blocks
+        return json.dumps(message)
 
-        upstream_host, upstream_target_port = self._upstream_targets.get(
-            upstream_port,
-            ("127.0.0.1", upstream_port),
+    def _normalize_openai_stream(self, events: list[dict[str, Any]]) -> str | None:
+        completion: dict[str, Any] | None = None
+        choices_by_index: dict[int, dict[str, Any]] = {}
+        usage: dict[str, Any] | None = None
+
+        for event in events:
+            choices = event.get("choices")
+            if not isinstance(choices, list):
+                continue
+
+            if completion is None:
+                completion = {key: value for key, value in event.items() if key != "choices"}
+                if isinstance(completion.get("object"), str) and completion["object"].endswith(".chunk"):
+                    completion["object"] = completion["object"][:-6]
+
+            for choice in choices:
+                if not isinstance(choice, dict):
+                    return None
+                index = choice.get("index")
+                if not isinstance(index, int):
+                    return None
+                merged_choice = choices_by_index.setdefault(index, {"index": index, "message": {}})
+                delta = choice.get("delta")
+                if isinstance(delta, dict):
+                    message = merged_choice.setdefault("message", {})
+                    for key, value in delta.items():
+                        if isinstance(value, str) and isinstance(message.get(key), str):
+                            message[key] += value
+                        elif value is not None:
+                            message[key] = value
+                if choice.get("finish_reason") is not None:
+                    merged_choice["finish_reason"] = choice["finish_reason"]
+
+            if isinstance(event.get("usage"), dict):
+                usage = dict(event["usage"])
+
+        if completion is None:
+            return None
+
+        ordered_choices = [choices_by_index[index] for index in sorted(choices_by_index)]
+        if not ordered_choices:
+            return None
+        completion["choices"] = ordered_choices
+        if usage is not None:
+            completion["usage"] = usage
+        return json.dumps(completion)
+
+    def _normalize_logged_response(self, response_text: str, content_type: str | None) -> str:
+        if "text/event-stream" not in (content_type or "").lower():
+            return response_text
+        normalized = self._normalize_sse_payload(response_text)
+        return normalized if normalized is not None else response_text
+
+    def _dump_bug_report(
+        self,
+        *,
+        scope: dict[str, Any],
+        request_body: bytes,
+        response_body: bytes,
+        upstream_url: str | None,
+        response_status_code: int | None,
+        route_reason: str | None,
+        exc: BaseException,
+    ) -> None:
+        BUG_REPORT_PATH.parent.mkdir(parents=True, exist_ok=True)
+        report = {
+            "created_ns": time.time_ns(),
+            "exception_type": type(exc).__name__,
+            "exception_message": str(exc),
+            "traceback": traceback.format_exc(),
+            "request": {
+                "method": scope.get("method"),
+                "path": scope.get("path"),
+                "query_string": scope.get("query_string", b"").decode("latin1"),
+                "body_text": request_body.decode("utf-8", errors="replace"),
+            },
+            "response": {
+                "status_code": response_status_code,
+                "body_text": response_body.decode("utf-8", errors="replace"),
+            },
+            "upstream_url": upstream_url,
+            "route_reason": route_reason,
+        }
+        BUG_REPORT_PATH.write_text(
+            json.dumps(report, indent=2, ensure_ascii=False),
+            encoding="utf-8",
         )
-        upstream_url = f"http://{upstream_host}:{upstream_target_port}{path}"
-        headers = self._build_upstream_headers(scope["headers"], upstream_port)
-        request = client.build_request(method, upstream_url, headers=headers, content=request_body)
 
-        try:
-            response = await client.send(request, stream=True)
-        except httpx.HTTPError as exc:
-            await self._send_plain_error(send, 502, f"Upstream request failed: {exc}".encode("utf-8"))
-            return
-
-        endpoint_label = self._endpoint_label_by_port.get(
-            upstream_port,
-            f"{upstream_host}:{upstream_target_port}",
-        )
-        self.endpoint_request_counts[endpoint_label] = (
-            self.endpoint_request_counts.get(endpoint_label, 0) + 1
-        )
-
-        response_headers = [
-            (key.encode("latin1"), value.encode("latin1"))
-            for key, value in response.headers.items()
-            if key.lower().encode("latin1") not in HOP_BY_HOP_HEADERS
-        ]
-        response_headers.append((b"connection", b"close"))
+    async def _handle_http(self, scope, receive, send) -> None:
+        request_body = b""
         response_chunks = bytearray()
-
-        await send(
-            {
-                "type": "http.response.start",
-                "status": response.status_code,
-                "headers": response_headers,
-            }
-        )
+        upstream_url: str | None = None
+        response_status_code: int | None = None
+        route_reason: str | None = None
 
         try:
-            async for chunk in response.aiter_raw():
-                if chunk:
-                    response_chunks.extend(chunk)
-                await send({"type": "http.response.body", "body": chunk, "more_body": True})
-        finally:
-            await response.aclose()
+            valid_endpoints = list(self.valid_endpoints)
+            if not valid_endpoints:
+                await self._send_plain_error(send, 503, b"No upstream ports configured")
+                return
 
-        await send({"type": "http.response.body", "body": b"", "more_body": False})
+            client = self.client or self._build_client()
+            method = scope["method"]
+            path = scope.get("raw_path", scope["path"].encode("utf-8")).decode("utf-8")
+            query_string = scope.get("query_string", b"")
+            if query_string:
+                path = f"{path}?{query_string.decode('latin1')}"
 
-        if prepared_request is not None and lookup is not None:
-            response_payload = self._decoded_response_payload(
-                bytes(response_chunks),
-                response.headers.get("content-type"),
-            )
-            job = self._build_persistence_job(
-                prepared_request,
-                lookup,
+            request_chunks = bytearray()
+            while True:
+                message = await receive()
+                if message["type"] != "http.request":
+                    continue
+                body = message.get("body", b"")
+                if body:
+                    request_chunks.extend(body)
+                if not message.get("more_body", False):
+                    break
+
+            request_body = bytes(request_chunks)
+            prepared_request = self._prepare_request_state(request_body)
+            if prepared_request is not None:
+                upstream_port, route_reason, lookup = self._select_upstream_for_prepared_request(
+                    prepared_request,
+                    valid_endpoints,
+                )
+            else:
+                upstream_port = random.choice([endpoint.port for endpoint in valid_endpoints])
+                route_reason = "random"
+                lookup = None
+
+            upstream_host, upstream_target_port = self._upstream_targets.get(
                 upstream_port,
-                endpoint_label,
-                response_payload,
-                route_reason,
-                response.status_code,
+                ("127.0.0.1", upstream_port),
             )
-            logger.debug(
-                "[http] submitting persist job conv={} state_hash={}",
-                job.conversation_id,
-                job.prepared_request.state_hash,
+            upstream_url = f"http://{upstream_host}:{upstream_target_port}{path}"
+            headers = self._build_upstream_headers(scope["headers"], upstream_port)
+            request = client.build_request(method, upstream_url, headers=headers, content=request_body)
+
+            try:
+                response = await client.send(request, stream=True)
+            except httpx.HTTPError as exc:
+                await self._send_plain_error(send, 502, f"Upstream request failed: {exc}".encode("utf-8"))
+                return
+
+            endpoint_label = self._endpoint_label_by_port.get(
+                upstream_port,
+                f"{upstream_host}:{upstream_target_port}",
             )
-            self.state_store.submit(job)
+            self.endpoint_request_counts[endpoint_label] = (
+                self.endpoint_request_counts.get(endpoint_label, 0) + 1
+            )
+
+            response_headers = [
+                (key.encode("latin1"), value.encode("latin1"))
+                for key, value in response.headers.items()
+                if key.lower().encode("latin1") not in HOP_BY_HOP_HEADERS
+            ]
+            if lookup is not None:
+                response_headers.append(
+                    (b"x-llm-proxy-conversation-id", lookup.conversation_id.encode("ascii"))
+                )
+                response_headers.append(
+                    (b"x-llm-proxy-route-reason", route_reason.encode("ascii"))
+                )
+            response_headers.append((b"connection", b"close"))
+            response_status_code = response.status_code
+
+            await send(
+                {
+                    "type": "http.response.start",
+                    "status": response.status_code,
+                    "headers": response_headers,
+                }
+            )
+
+            try:
+                async for chunk in response.aiter_raw():
+                    if chunk:
+                        response_chunks.extend(chunk)
+                    await send({"type": "http.response.body", "body": chunk, "more_body": True})
+            finally:
+                await response.aclose()
+
+            await send({"type": "http.response.body", "body": b"", "more_body": False})
+
+            if prepared_request is not None and lookup is not None:
+                response_payload = self._decoded_response_payload(
+                    bytes(response_chunks),
+                    response.headers.get("content-type"),
+                )
+                job = self._build_persistence_job(
+                    prepared_request,
+                    lookup,
+                    upstream_port,
+                    endpoint_label,
+                    response_payload,
+                    route_reason,
+                    response.status_code,
+                )
+                logger.debug(
+                    "[http] submitting persist job conv={} state_hash={}",
+                    job.conversation_id,
+                    job.prepared_request.state_hash,
+                )
+                self.state_store.submit(job)
+        except Exception as exc:
+            self._dump_bug_report(
+                scope=scope,
+                request_body=request_body,
+                response_body=bytes(response_chunks),
+                upstream_url=upstream_url,
+                response_status_code=response_status_code,
+                route_reason=route_reason,
+                exc=exc,
+            )
+            raise
 
     def _build_upstream_headers(self, headers, upstream_port: int) -> list[tuple[str, str]]:
         forwarded_headers: list[tuple[str, str]] = []

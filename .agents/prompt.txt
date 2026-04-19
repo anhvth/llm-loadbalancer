@@ -1,0 +1,89 @@
+You are a coding agent working in /home/anhvth8/projects/llm-loadbalancer.
+
+Goal:
+Debug load_balancer_v2 conversation persistence/routing so a follow-up request reuses the same conversation_id and the SQLite conversation row grows.
+
+Important context:
+- We are focusing only on load_balancer_v2.py.
+- Do not reintroduce dependency on load_balancer.py.
+- The active config is /home/anhvth8/.config/llm-proxy.yaml.
+- The state database is ~/.cache/llm-proxy/state.sqlite3.
+- The monitor is not the primary issue. The testing target is tools/db/send_request.py and direct SQLite verification.
+- load_balancer_v2.py currently injects these response headers:
+  - x-llm-proxy-conversation-id
+  - x-llm-proxy-route-reason
+- tools/db/send_request.py sends:
+  1. user: "hello"
+  2. user: "hello", assistant: <turn 1 assistant text>, user: "this is new"
+  Then it checks whether both responses report the same conversation_id and whether the DB request count grew.
+
+Actions:
+1. Submit the lb job in tmux.
+   Use this command pattern:
+   tmux kill-session -t lb || true
+   tmux new-session -d -s lb 'cd /home/anhvth8/projects/llm-loadbalancer && uv run load_balancer_v2.py'
+
+2. Verify lb is listening and healthy:
+   curl -i http://127.0.0.1:8001/v1/models
+   If this fails, inspect:
+   tmux capture-pane -pt lb:0 | tail -n 160
+
+3. Run the test script:
+   python tools/db/send_request.py
+
+Expected result:
+- turn_1.conversation_id == turn_2.conversation_id
+- same_conversation_id is true
+- conversation_grew is true
+- turn_2 route_reason should ideally be "conversation" or otherwise still use the same conversation_id from exact-prefix lookup.
+
+Current observed failure:
+- tools/db/send_request.py sometimes fails with HTTP 503 because upstream selection can hit a bad endpoint even though health output may claim endpoints are UP.
+- In a previous successful run, turn 1 and turn 2 returned different conversation IDs:
+  - turn_1 conversation_id: a9e967977714424e9bf4a6442df958ef
+  - turn_2 conversation_id: d9bd2c5f2ae84e3db2da752b061e4bf6
+  - same_conversation_id: false
+  - conversation_grew: false
+- The DB did persist both requests, but as separate conversations.
+
+TODO debug:
+1. Confirm whether turn 2 lookup sees the exact prefix hash for the first message.
+   The expected first-message state hash for user "hello" was observed as:
+   f4f7e767b9a1966921d93f1818bb0238c1633ed715f29a789b4e3a624ab16512
+
+2. If the row exists in input_states but lookup still creates a new conversation, debug SqliteConversationStateStore.lookup.
+   Suspect: the long-lived read connection may not see writes made by AsyncSqliteStateWriter without refresh/reopen/commit behavior.
+   Look specifically at:
+   - SqliteConversationStateStore.__init__
+   - SqliteConversationStateStore.lookup
+   - AsyncSqliteStateWriter._run
+   - _persist_job_with_connection
+
+3. Make lookup see recently persisted states before turn 2.
+   Prefer the smallest fix:
+   - refresh/reopen the read connection before lookup, or
+   - use a fresh read connection per lookup, or
+   - otherwise ensure SQLite WAL writes are visible to the lookup connection.
+   Avoid broad refactors.
+
+4. Confirm async write timing is not the only issue.
+   tools/db/send_request.py now polls SQLite after turn 1 before sending turn 2. If same_conversation_id is still false after polling, the bug is inside lookup visibility/matching rather than test timing.
+
+5. Improve handling of unhealthy endpoints if needed.
+   If /v1/models says UP but chat requests get 503, inspect how valid_endpoints is refreshed and whether failed upstream requests should be removed/retried.
+   Do not make speculative large changes; first prove the root cause from logs and DB.
+
+Verification commands:
+- python -m py_compile load_balancer_v2.py tools/db/send_request.py
+- tmux kill-session -t lb || true
+- tmux new-session -d -s lb 'cd /home/anhvth8/projects/llm-loadbalancer && uv run load_balancer_v2.py'
+- curl -i http://127.0.0.1:8001/v1/models
+- python tools/db/send_request.py
+- python tools/db/count.py
+- python tools/db/query.py
+
+Success criteria:
+- tools/db/send_request.py prints same_conversation_id: true.
+- tools/db/send_request.py prints conversation_grew: true.
+- No new bug report appears at .log/error/bug_report.json for the successful test.
+- The change is surgical and limited to the files needed for the above behavior.

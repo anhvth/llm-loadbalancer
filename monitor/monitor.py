@@ -778,6 +778,11 @@ def api_overview() -> dict[str, Any]:
     return collect_overview()
 
 
+@app.get("/api/summary")
+def api_summary() -> dict[str, Any]:
+    return collect_overview()
+
+
 @app.get("/api/conversations")
 def api_conversations(
     limit: int = Query(default=60, ge=1, le=MAX_CONVERSATIONS),
@@ -1705,15 +1710,34 @@ HTML_TEMPLATE = """
     }
 
     async function refreshAll() {
+      const errors = [];
+
       try {
-        await loadOverview();
         await loadConversations();
+      } catch (error) {
+        errors.push(error);
+      }
+
+      try {
         await loadSelectedConversation();
       } catch (error) {
+        errors.push(error);
+      }
+
+      try {
+        await loadOverview();
+      } catch (error) {
+        errors.push(error);
+      }
+
+      if (errors.length) {
         nodes.databaseError.innerHTML =
-          "<div class=\\"error-banner\\">" + escapeHtml(error.message || String(error)) + "</div>";
+          "<div class=\\"error-banner\\">" +
+          errors.map((error) => escapeHtml(error.message || String(error))).join("<br>") +
+          "</div>";
         return;
       }
+
       nodes.databaseError.innerHTML = "";
     }
 
