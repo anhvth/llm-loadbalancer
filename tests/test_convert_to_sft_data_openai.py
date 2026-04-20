@@ -29,6 +29,36 @@ class _FakeTokenizer:
         )
 
 
+class _FakeMiniMaxTokenizer:
+    bos_token = "]~!b["
+    eos_token = "[e~["
+
+    def __init__(self):
+        self.calls = []
+
+    def apply_chat_template(
+        self,
+        messages,
+        tools=None,
+        tokenize=False,
+        add_generation_prompt=False,
+    ):
+        self.calls.append(
+            {
+                "messages": messages,
+                "tools": tools,
+                "tokenize": tokenize,
+                "add_generation_prompt": add_generation_prompt,
+            }
+        )
+        rendered = []
+        for index, message in enumerate(messages):
+            role = "ai" if message["role"] == "assistant" else message["role"]
+            bos = self.bos_token if index == 0 else ""
+            rendered.append(f"{bos}]~b]{role}\n{message['content']}{self.eos_token}\n")
+        return "".join(rendered)
+
+
 def test_convert_openai_chat_completion_embeds_reasoning_in_content():
     converted = convert_to_sft_data_openai.convert_openai_chat_record(
         {
@@ -138,4 +168,44 @@ def test_split_rendered_chat_returns_role_content_only():
         {"role": "system", "content": "sys"},
         {"role": "user", "content": "hi"},
         {"role": "assistant", "content": "<think>\nreason\n</think>\n\nhello"},
+    ]
+
+
+def test_dispatcher_writes_messages_from_minimax_rendered_template(
+    tmp_path: Path,
+    monkeypatch,
+):
+    input_path = tmp_path / "input.jsonl"
+    output_path = tmp_path / "output.jsonl"
+    input_path.write_text(
+        json.dumps(
+            {
+                "input": {
+                    "messages": [
+                        {"role": "system", "content": "sys"},
+                        {"role": "user", "content": "hi"},
+                    ],
+                },
+                "output": {
+                    "choices": [
+                        {"message": {"role": "assistant", "content": "hello"}}
+                    ],
+                },
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    tokenizer = _FakeMiniMaxTokenizer()
+    monkeypatch.setattr(convert_to_sft_data, "_load_tokenizer", lambda _: tokenizer)
+
+    convert_to_sft_data.convert_jsonl(input_path, output_path)
+
+    row = json.loads(output_path.read_text(encoding="utf-8"))
+    assert list(row) == ["messages"]
+    assert row["messages"] == [
+        {"role": "system", "content": "sys"},
+        {"role": "user", "content": "hi"},
+        {"role": "assistant", "content": "hello"},
     ]

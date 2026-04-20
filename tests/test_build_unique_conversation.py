@@ -115,6 +115,40 @@ def test_convert_row_includes_openai_output_in_rendered_prompt():
     assert sft_messages[-1]["content"] == "hello from openai"
 
 
+def test_convert_row_parses_minimax_rendered_assistant_output():
+    """MiniMax renders assistant as `ai`; export should keep assistant role/content."""
+
+    class _FakeMiniMaxTokenizer:
+        bos_token = "]~!b["
+        eos_token = "[e~["
+
+        def apply_chat_template(
+            self, messages, tools=None, tokenize=False, add_generation_prompt=False
+        ):
+            rendered = []
+            for index, message in enumerate(messages):
+                role = "ai" if message["role"] == "assistant" else message["role"]
+                bos = self.bos_token if index == 0 else ""
+                rendered.append(f"{bos}]~b]{role}\n{message['content']}{self.eos_token}\n")
+            return "".join(rendered)
+
+    record = {
+        "input": {"messages": [{"role": "user", "content": "hi"}]},
+        "output": {
+            "choices": [
+                {"message": {"role": "assistant", "content": "hello from minimax"}}
+            ],
+        },
+    }
+    sft_messages, rendered = _convert_row(record, _FakeMiniMaxTokenizer())
+
+    assert "]~b]ai\nhello from minimax[e~[" in rendered
+    assert sft_messages[-1] == {
+        "role": "assistant",
+        "content": "hello from minimax",
+    }
+
+
 def test_convert_row_includes_anthropic_output_in_rendered_prompt():
     """Anthropic-format outputs must appear in the rendered prompt."""
 
