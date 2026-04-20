@@ -1812,7 +1812,7 @@ requires-dist = [
     { name = "httpx", specifier = ">=0.28.1" },
     { name = "loguru", specifier = ">=0.7.3" },
     { name = "pytest", specifier = ">=9.0.3" },
-    { name = "speedy-utils", directory = "../speedy_utils" },
+    { name = "speedy-utils", editable = "../speedy_utils" },
     { name = "tabulate", specifier = ">=0.9.0" },
     { name = "transformers", specifier = ">=5.5.4" },
     { name = "uvicorn", specifier = ">=0.44.0" },
@@ -4085,7 +4085,7 @@ wheels = [
 [[package]]
 name = "speedy-utils"
 version = "2.0.6"
-source = { directory = "../speedy_utils" }
+source = { editable = "../speedy_utils" }
 dependencies = [
     { name = "aiohttp" },
     { name = "bump2version" },

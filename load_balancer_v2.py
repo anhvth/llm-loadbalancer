@@ -251,6 +251,7 @@ class PreparedChatRequest:
     message_hashes: tuple[str, ...]
     exact_prefix_hashes: tuple[str, ...]
     loose_prefix_hashes: tuple[str, ...]
+    session_id: str | None = None
 
     @property
     def message_count(self) -> int:
@@ -341,6 +342,26 @@ def _normalize_loose_value(value: Any) -> str:
     return repr(value)
 
 
+def _extract_session_id(payload: dict[str, Any]) -> str | None:
+    """Extract session_id from Anthropic metadata.user_id JSON string."""
+    metadata = payload.get("metadata")
+    if not isinstance(metadata, dict):
+        return None
+    user_id_raw = metadata.get("user_id")
+    if not isinstance(user_id_raw, str):
+        return None
+    try:
+        user_id = json.loads(user_id_raw)
+    except (json.JSONDecodeError, ValueError):
+        return None
+    if not isinstance(user_id, dict):
+        return None
+    session_id = user_id.get("session_id")
+    if not isinstance(session_id, str) or not session_id:
+        return None
+    return session_id
+
+
 def prepare_chat_request(payload: Any) -> PreparedChatRequest | None:
     if not isinstance(payload, dict):
         return None
@@ -377,6 +398,7 @@ def prepare_chat_request(payload: Any) -> PreparedChatRequest | None:
         message_hashes=tuple(message_hashes),
         exact_prefix_hashes=tuple(exact_prefix_hashes),
         loose_prefix_hashes=tuple(loose_prefix_hashes),
+        session_id=_extract_session_id(payload),
     )
 
 
@@ -476,6 +498,17 @@ def _create_state_db_schema(connection: sqlite3.Connection) -> None:
         CREATE TABLE IF NOT EXISTS route_affinity (
             loose_hash TEXT PRIMARY KEY,
             message_count INTEGER NOT NULL,
+            conversation_id TEXT NOT NULL,
+            base_url TEXT NOT NULL,
+            upstream_port INTEGER NOT NULL,
+            last_seen_ns INTEGER NOT NULL
+        )
+        """
+    )
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS session_affinity (
+            session_id TEXT PRIMARY KEY,
             conversation_id TEXT NOT NULL,
             base_url TEXT NOT NULL,
             upstream_port INTEGER NOT NULL,
@@ -723,6 +756,31 @@ def _persist_job_with_connection(connection: sqlite3.Connection, job: Persistenc
                 now_ns,
             ),
         )
+        if prepared.session_id is not None:
+            connection.execute(
+                """
+                INSERT INTO session_affinity(
+                    session_id,
+                    conversation_id,
+                    base_url,
+                    upstream_port,
+                    last_seen_ns
+                )
+                VALUES(?, ?, ?, ?, ?)
+                ON CONFLICT(session_id) DO UPDATE SET
+                    conversation_id = excluded.conversation_id,
+                    base_url = excluded.base_url,
+                    upstream_port = excluded.upstream_port,
+                    last_seen_ns = excluded.last_seen_ns
+                """,
+                (
+                    prepared.session_id,
+                    actual_conversation_id,
+                    job.base_url,
+                    job.upstream_port,
+                    now_ns,
+                ),
+            )
     except Exception:
         connection.execute("ROLLBACK")
         raise
@@ -872,6 +930,31 @@ class SqliteConversationStateStore:
                         "[lookup] upstream_port {} not in valid_ports {}",
                         upstream_port,
                         valid_ports,
+                    )
+
+        if prepared_request.session_id is not None:
+            session_row = self._read_connection.execute(
+                "SELECT conversation_id, upstream_port, base_url FROM session_affinity WHERE session_id = ?",
+                (prepared_request.session_id,),
+            ).fetchone()
+            if session_row is not None:
+                s_port = session_row["upstream_port"]
+                s_base = session_row["base_url"]
+                s_conv = str(session_row["conversation_id"])
+                if isinstance(s_port, int) and s_port in valid_ports:
+                    logger.info(
+                        "[lookup] route=session conv={} port={} session={}",
+                        s_conv,
+                        s_port,
+                        prepared_request.session_id,
+                    )
+                    return RouteLookupResult(
+                        conversation_id=s_conv,
+                        matched_state_hash=matched_state_hash,
+                        matched_message_count=matched_message_count,
+                        preferred_upstream_port=s_port,
+                        preferred_base_url=str(s_base) if isinstance(s_base, str) else None,
+                        route_reason="session",
                     )
 
         loose_row = _query_longest_prefix(

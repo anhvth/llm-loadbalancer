@@ -20,6 +20,7 @@ llm-proxy = "main:main"
 collect-jsonl = "llm_loadbalancer.tools.collect_jsonl:main"
 build-unique-sft = "llm_loadbalancer.tools.build_unique_conversation:main"
 annotate-full-conversations = "llm_loadbalancer.tools.annotate_full_conversations:main"
+cat_sft_messages = "llm_loadbalancer.tools.cat_sft_messages:main"
 
 [build-system]
 requires = ["hatchling"]
@@ -29,9 +30,10 @@ build-backend = "hatchling.build"
 package = true
 
 [tool.uv.sources]
-speedy-utils = { path = "../speedy_utils" }
+speedy-utils = { path = "../speedy_utils", editable = true }
 
 [tool.hatch.build.targets.wheel]
+sources = ["src"]
 only-include = [
     "cat_db.py",
     "main.py",
@@ -46,6 +48,7 @@ only-include = [
     "src/llm_loadbalancer/tools/convert_to_sft_data.py",
     "src/llm_loadbalancer/tools/convert_to_sft_data_anthropic.py",
     "src/llm_loadbalancer/tools/convert_to_sft_data_openai.py",
+    "src/llm_loadbalancer/tools/cat_sft_messages.py",
 ]
 
 [tool.pytest.ini_options]

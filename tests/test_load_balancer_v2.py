@@ -339,3 +339,75 @@ def test_collect_jsonl_exports_pending_v2_rows_incrementally(monkeypatch, tmp_pa
         assert collected_at_ns is not None
     finally:
         app.state_store.close()
+
+
+def test_v2_session_id_affinity_routes_to_same_port(monkeypatch, tmp_path: Path):
+    """Requests with the same Anthropic session_id should route to the same port."""
+    app = build_app(monkeypatch, tmp_path, [18000, 18001])
+    try:
+        session_meta = json.dumps({
+            "device_id": "test-device",
+            "account_uuid": "",
+            "session_id": "session-abc-123",
+        })
+        first_payload = {
+            "model": "demo",
+            "messages": [{"role": "user", "content": "hello"}],
+            "metadata": {"user_id": session_meta},
+        }
+        # Different message content but same session_id
+        second_payload = {
+            "model": "demo",
+            "messages": [{"role": "user", "content": "different content"}],
+            "metadata": {"user_id": session_meta},
+        }
+
+        _, _, first_port, _ = persist_payload(app, first_payload)
+        _, _, second_port, second_reason = persist_payload(app, second_payload)
+
+        assert second_port == first_port
+        assert second_reason == "session"
+    finally:
+        app.state_store.close()
+
+
+def test_v2_different_session_ids_may_route_differently(monkeypatch, tmp_path: Path):
+    """Requests with different session_ids are not forced to the same port."""
+    app = build_app(monkeypatch, tmp_path, [18000, 18001])
+    try:
+        meta_a = json.dumps({"device_id": "d", "session_id": "session-A"})
+        meta_b = json.dumps({"device_id": "d", "session_id": "session-B"})
+        payload_a = {
+            "model": "demo",
+            "messages": [{"role": "user", "content": "a"}],
+            "metadata": {"user_id": meta_a},
+        }
+        payload_b = {
+            "model": "demo",
+            "messages": [{"role": "user", "content": "b"}],
+            "metadata": {"user_id": meta_b},
+        }
+
+        prepared_a = load_balancer_v2.prepare_chat_request(payload_a)
+        prepared_b = load_balancer_v2.prepare_chat_request(payload_b)
+        assert prepared_a is not None
+        assert prepared_b is not None
+        assert prepared_a.session_id == "session-A"
+        assert prepared_b.session_id == "session-B"
+        # They have different session_ids, so they are independent
+    finally:
+        app.state_store.close()
+
+
+def test_v2_no_session_id_falls_back(monkeypatch, tmp_path: Path):
+    """Requests without session_id metadata do not crash and route normally."""
+    app = build_app(monkeypatch, tmp_path, [18000])
+    try:
+        payload = {"model": "demo", "messages": [{"role": "user", "content": "hi"}]}
+        prepared = load_balancer_v2.prepare_chat_request(payload)
+        assert prepared is not None
+        assert prepared.session_id is None
+        _, _, port, reason = persist_payload(app, payload)
+        assert port == 18000
+    finally:
+        app.state_store.close()

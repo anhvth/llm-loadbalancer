@@ -46,23 +46,48 @@ def _record_tools(record: dict[str, Any]) -> list[dict[str, Any]] | None:
 
 
 def split_rendered_chat(rendered: str) -> list[dict[str, str]]:
-    messages = []
-    for segment in rendered.split(_IM_END):
+    """Parse rendered chat template into role/content dicts.
+
+    Handles content that itself contains literal <|im_start|>/<|im_end|> tokens
+    (e.g. code conversations about chat templates) by only recognising
+    <|im_start|> when it appears at the very start of a segment after an
+    <|im_end|> split boundary.
+    """
+    raw_segments = rendered.split(_IM_END)
+
+    messages: list[dict[str, str]] = []
+    pending: str | None = None
+
+    for segment in raw_segments:
         segment = segment.lstrip("\n")
         if not segment.strip():
             continue
 
-        if not segment.startswith(_IM_START):
-            raise ValueError(f"Rendered chat segment does not start with {_IM_START!r}")
+        if segment.startswith(_IM_START):
+            # Flush any previous pending message
+            if pending is not None:
+                _flush_pending(pending, messages)
+            pending = segment[len(_IM_START):]
+        else:
+            # This segment is a continuation — the content itself contained
+            # a literal <|im_end|> token.  Re-attach it.
+            if pending is not None:
+                pending += _IM_END + "\n" + segment
+            else:
+                # Leading content before the first <|im_start|>; skip.
+                continue
 
-        payload = segment[len(_IM_START):]
-        role, separator, content = payload.partition("\n")
-        if not separator:
-            raise ValueError("Rendered chat segment is missing role/content separator")
-
-        messages.append({"role": role.strip(), "content": content})
+    if pending is not None:
+        _flush_pending(pending, messages)
 
     return messages
+
+
+def _flush_pending(payload: str, messages: list[dict[str, str]]) -> None:
+    role, separator, content = payload.partition("\n")
+    if not separator:
+        raise ValueError("Rendered chat segment is missing role/content separator")
+    messages.append({"role": role.strip(), "content": content})
 
 
 def render_messages_for_sft(

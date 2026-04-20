@@ -13,8 +13,11 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+from collections import defaultdict
 from pathlib import Path
 from typing import Any, Sequence
+
+from tqdm import tqdm
 
 from llm_loadbalancer.tools.convert_to_sft_data import (
     DEFAULT_TOKENIZER,
@@ -52,6 +55,83 @@ def _convert_row(
     return sft_messages, rendered
 
 
+def extract_anthropic_session_id(record: dict[str, Any]) -> str | None:
+    """Extract session_id from Anthropic metadata.user_id JSON string.
+
+    Returns None if metadata is missing, malformed, or has no session_id.
+    """
+    source = record.get("input") if "input" in record else record
+    if not isinstance(source, dict):
+        return None
+    metadata = source.get("metadata")
+    if not isinstance(metadata, dict):
+        return None
+    user_id_raw = metadata.get("user_id")
+    if not isinstance(user_id_raw, str):
+        return None
+    try:
+        user_id = json.loads(user_id_raw)
+    except (json.JSONDecodeError, ValueError):
+        return None
+    if not isinstance(user_id, dict):
+        return None
+    session_id = user_id.get("session_id")
+    if not isinstance(session_id, str) or not session_id:
+        return None
+    return session_id
+
+
+def _select_best_record(records: list[dict[str, Any]]) -> dict[str, Any]:
+    """Pick the best representative from a group sharing the same session_id.
+
+    Prefers: longest messages list, then latest timestamp, then has output.
+    """
+    def _score(rec: dict[str, Any]) -> tuple[int, str, bool]:
+        source = rec.get("input") if "input" in rec else rec
+        msgs = source.get("messages", []) if isinstance(source, dict) else []
+        msg_count = len(msgs) if isinstance(msgs, list) else 0
+        ts = rec.get("timestamp", "")
+        has_output = bool(rec.get("output"))
+        return (msg_count, ts, has_output)
+
+    return max(records, key=_score)
+
+
+def group_by_session_then_dedupe(
+    records: list[dict[str, Any]],
+    tokenizer: Any,
+) -> list[list[dict[str, str]]]:
+    """Group raw records by Anthropic session_id, pick best per group, then dedupe.
+
+    Records with a valid session_id are grouped; only the best representative
+    per session is kept. Records without a session_id go through the existing
+    rendered-prompt deduplication.
+    """
+    session_groups: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    no_session: list[dict[str, Any]] = []
+
+    for record in records:
+        sid = extract_anthropic_session_id(record)
+        if sid is not None:
+            session_groups[sid].append(record)
+        else:
+            no_session.append(record)
+
+    # Convert best-per-session to SFT items
+    items: list[tuple[list[dict[str, str]], str]] = []
+    for sid, group in tqdm(session_groups.items(), desc="Session groups"):
+        best = _select_best_record(group)
+        sft_messages, rendered = _convert_row(best, tokenizer)
+        items.append((sft_messages, rendered))
+
+    # Convert no-session records
+    for record in tqdm(no_session, desc="No-session records"):
+        sft_messages, rendered = _convert_row(record, tokenizer)
+        items.append((sft_messages, rendered))
+
+    return deduplicate_by_rendered_prompt(items)
+
+
 def deduplicate_by_rendered_prompt(
     items: list[tuple[list[dict[str, str]], str]],
 ) -> list[list[dict[str, str]]]:
@@ -80,7 +160,7 @@ def deduplicate_by_rendered_prompt(
     # 3. Drop any prompt that is a substring of an already-kept (longer) prompt
     kept_messages: list[list[dict[str, str]]] = []
     kept_prompts: list[str] = []
-    for messages, prompt in unique:
+    for messages, prompt in tqdm(unique, desc="Deduplicating"):
         if any(prompt in kp for kp in kept_prompts):
             continue
         kept_messages.append(messages)
@@ -97,23 +177,21 @@ def build_unique_sft(
     """Read raw logs, convert to SFT, deduplicate, write output."""
     tokenizer = _load_tokenizer(tokenizer_name)
 
-    items: list[tuple[list[dict[str, str]], str]] = []
+    records: list[dict[str, Any]] = []
     with input_path.open(encoding="utf-8") as fh:
-        for line in fh:
+        for line in tqdm(fh, desc="Reading records", unit="lines"):
             if not line.strip():
                 continue
-            record = json.loads(line)
-            sft_messages, rendered = _convert_row(record, tokenizer)
-            items.append((sft_messages, rendered))
+            records.append(json.loads(line))
 
-    kept = deduplicate_by_rendered_prompt(items)
+    kept = group_by_session_then_dedupe(records, tokenizer)
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     with output_path.open("w", encoding="utf-8") as fh:
         for messages in kept:
             fh.write(json.dumps({"messages": messages}, ensure_ascii=False) + "\n")
 
-    return len(items), len(kept)
+    return len(records), len(kept)
 
 
 def build_parser() -> argparse.ArgumentParser:
