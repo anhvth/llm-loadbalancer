@@ -11,9 +11,7 @@ Pipeline:
 from __future__ import annotations
 
 import argparse
-import json
 import sys
-from collections import defaultdict
 from pathlib import Path
 from typing import Any, Sequence
 
@@ -58,117 +56,92 @@ def _convert_row(
     return sft_messages, rendered
 
 
-def extract_anthropic_session_id(record: dict[str, Any]) -> str | None:
-    """Extract session_id from Anthropic metadata.user_id JSON string.
-
-    Returns None if metadata is missing, malformed, or has no session_id.
-    """
-    source = record.get("input") if "input" in record else record
-    if not isinstance(source, dict):
-        return None
-    metadata = source.get("metadata")
-    if not isinstance(metadata, dict):
-        return None
-    user_id_raw = metadata.get("user_id")
-    if not isinstance(user_id_raw, str):
-        return None
-    try:
-        user_id = json.loads(user_id_raw)
-    except (json.JSONDecodeError, ValueError):
-        return None
-    if not isinstance(user_id, dict):
-        return None
-    session_id = user_id.get("session_id")
-    if not isinstance(session_id, str) or not session_id:
-        return None
-    return session_id
-
-
-def _select_best_record(records: list[dict[str, Any]]) -> dict[str, Any]:
-    """Pick the best representative from a group sharing the same session_id.
-
-    Prefers: longest messages list, then latest timestamp, then has output.
-    """
-    def _score(rec: dict[str, Any]) -> tuple[int, str, bool]:
-        source = rec.get("input") if "input" in rec else rec
-        msgs = source.get("messages", []) if isinstance(source, dict) else []
-        msg_count = len(msgs) if isinstance(msgs, list) else 0
-        ts = rec.get("timestamp", "")
-        has_output = bool(rec.get("output"))
-        return (msg_count, ts, has_output)
-
-    return max(records, key=_score)
-
-
 def _render_row_prompt(record: dict[str, Any], tokenizer: Any) -> str:
     converted = convert_record(record)
     tools = _record_tools(record)
     return _render_prompt_string(converted["messages"], tokenizer, tools=tools)
 
 
-def _drop_prefix_prompts(prompts: list[str]) -> list[str]:
-    """Drop prompts that are strict prefixes of longer prompts."""
-    if not prompts:
+def _drop_prefix_prompt_entries(
+    entries: list[tuple[str, str]],
+) -> list[tuple[str, str]]:
+    """Drop prompt entries whose prompt is a strict prefix of a longer prompt.
+
+    Keeps the latest timestamp for exact-equal prompts.
+    """
+    if not entries:
         return []
 
-    # Exact dedupe first while preserving first-seen item.
-    unique_prompts: list[str] = []
-    seen: set[str] = set()
-    for prompt in prompts:
-        if prompt in seen:
-            continue
-        seen.add(prompt)
-        unique_prompts.append(prompt)
+    latest_by_prompt: dict[str, str] = {}
+    for prompt, timestamp in entries:
+        prev = latest_by_prompt.get(prompt, "")
+        latest_by_prompt[prompt] = max(prev, timestamp or "")
 
-    # Longer prompts first so strict-prefix checks only look backward.
-    unique_prompts.sort(key=len, reverse=True)
+    unique_entries = [(prompt, ts) for prompt, ts in latest_by_prompt.items()]
+    unique_entries.sort(key=lambda item: len(item[0]), reverse=True)
 
-    kept: list[str] = []
-    for prompt in unique_prompts:
-        if any(len(prompt) < len(existing) and existing.startswith(prompt) for existing in kept):
+    kept: list[tuple[str, str]] = []
+    for prompt, timestamp in unique_entries:
+        if any(
+            len(prompt) < len(existing_prompt) and existing_prompt.startswith(prompt)
+            for existing_prompt, _ in kept
+        ):
             continue
-        kept.append(prompt)
+        kept.append((prompt, timestamp))
+    return kept
+
+
+def _deduplicate_items_by_rendered_prompt(
+    items: list[tuple[list[dict[str, str]], str, str]],
+) -> list[tuple[list[dict[str, str]], str, str]]:
+    """Deduplicate rendered items while preserving latest timestamp per prompt."""
+    if not items:
+        return []
+
+    latest_by_prompt: dict[str, tuple[list[dict[str, str]], str, str]] = {}
+    for messages, prompt, timestamp in items:
+        prev = latest_by_prompt.get(prompt)
+        if prev is None or (timestamp or "") >= prev[2]:
+            latest_by_prompt[prompt] = (messages, prompt, timestamp or "")
+
+    unique = list(latest_by_prompt.values())
+    unique.sort(key=lambda x: -len(x[1]))
+
+    kept: list[tuple[list[dict[str, str]], str, str]] = []
+    kept_prompts: list[str] = []
+    for messages, prompt, timestamp in tqdm(unique, desc="Deduplicating"):
+        if any(prompt in kp for kp in kept_prompts):
+            continue
+        kept.append((messages, prompt, timestamp))
+        kept_prompts.append(prompt)
     return kept
 
 
 def group_by_session_then_dedupe(
     records: list[dict[str, Any]],
     tokenizer: Any,
-) -> list[list[dict[str, str]]]:
-    """Group raw records by Anthropic session_id, pick best per group, then dedupe.
+    include_timestamps: bool = False,
+) -> list[list[dict[str, str]]] | list[tuple[list[dict[str, str]], str]]:
+    """Convert every row to prompt first, drop prefix snapshots, then dedupe."""
+    prompt_entries: list[tuple[str, str]] = []
+    for record in tqdm(records, desc="Rows to prompts"):
+        prompt_entries.append(
+            (_render_row_prompt(record, tokenizer), str(record.get("timestamp", "") or ""))
+        )
 
-    Records with a valid session_id are grouped; only the best representative
-    per session is kept. Records without a session_id go through the existing
-    rendered-prompt deduplication.
-    """
-    session_groups: dict[str, list[dict[str, Any]]] = defaultdict(list)
-    no_session: list[dict[str, Any]] = []
-
-    for record in records:
-        sid = extract_anthropic_session_id(record)
-        if sid is not None:
-            session_groups[sid].append(record)
-        else:
-            no_session.append(record)
-
-    # Convert best-per-session to SFT items
-    items: list[tuple[list[dict[str, str]], str]] = []
-    for sid, group in tqdm(session_groups.items(), desc="Session groups"):
-        best = _select_best_record(group)
-        sft_messages, rendered = _convert_row(best, tokenizer)
-        items.append((sft_messages, rendered))
-
-    # Convert no-session records: record -> rendered prompt -> prefix drop -> role/content
-    no_session_prompts: list[str] = []
-    for record in tqdm(no_session, desc="No-session records"):
-        no_session_prompts.append(_render_row_prompt(record, tokenizer))
     if drop_prefix_snapshots_in_unique():
-        no_session_prompts = _drop_prefix_prompts(no_session_prompts)
-    for rendered in no_session_prompts:
-        sft_messages = split_rendered_chat(rendered, tokenizer)
-        items.append((sft_messages, rendered))
+        prompt_entries = _drop_prefix_prompt_entries(prompt_entries)
 
-    return deduplicate_by_rendered_prompt(items)
+    items: list[tuple[list[dict[str, str]], str, str]] = []
+    for rendered, timestamp in prompt_entries:
+        sft_messages = split_rendered_chat(rendered, tokenizer)
+        items.append((sft_messages, rendered, timestamp))
+
+    kept = _deduplicate_items_by_rendered_prompt(items)
+    kept.sort(key=lambda item: item[2])
+    if include_timestamps:
+        return [(messages, timestamp) for messages, _, timestamp in kept]
+    return [messages for messages, _, _ in kept]
 
 
 def deduplicate_by_rendered_prompt(
@@ -182,30 +155,11 @@ def deduplicate_by_rendered_prompt(
         3. Substring filter:      O(n · k · L)  where k = kept count, L = avg length.
            k ≪ n after exact dedup, so practical cost is low.
     """
-    if not items:
-        return []
-
-    # 1. Exact dedup
-    seen: dict[str, int] = {}
-    unique: list[tuple[list[dict[str, str]], str]] = []
-    for messages, prompt in items:
-        if prompt not in seen:
-            seen[prompt] = len(unique)
-            unique.append((messages, prompt))
-
-    # 2. Sort longest first — longer prompts cannot be substrings of shorter ones
-    unique.sort(key=lambda x: -len(x[1]))
-
-    # 3. Drop any prompt that is a substring of an already-kept (longer) prompt
-    kept_messages: list[list[dict[str, str]]] = []
-    kept_prompts: list[str] = []
-    for messages, prompt in tqdm(unique, desc="Deduplicating"):
-        if any(prompt in kp for kp in kept_prompts):
-            continue
-        kept_messages.append(messages)
-        kept_prompts.append(prompt)
-
-    return kept_messages
+    normalized_items = [
+        (messages, prompt, "") for messages, prompt in items
+    ]
+    kept = _deduplicate_items_by_rendered_prompt(normalized_items)
+    return [messages for messages, _, _ in kept]
 
 
 def build_unique_sft(

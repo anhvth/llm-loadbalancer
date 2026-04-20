@@ -140,14 +140,14 @@ def test_select_best_record_prefers_with_output():
 # --- group_by_session_then_dedupe ---
 
 def test_same_session_collapses_to_one():
-    """Multiple records with the same session_id produce one SFT row."""
+    """Same-session rows are post-hoc deduped; non-prefix variants remain."""
     records = [
         _make_anthropic_record("s1", [{"role": "user", "content": "a"}], timestamp="2026-04-20T00:00:01+00:00"),
         _make_anthropic_record("s1", [{"role": "user", "content": "a"}, {"role": "assistant", "content": "b"}, {"role": "user", "content": "c"}], timestamp="2026-04-20T00:00:02+00:00"),
         _make_anthropic_record("s1", [{"role": "user", "content": "x"}], timestamp="2026-04-20T00:00:03+00:00"),
     ]
     kept = group_by_session_then_dedupe(records, _FakeTokenizer())
-    assert len(kept) == 1
+    assert len(kept) == 2
 
 
 def test_different_sessions_remain_separate():

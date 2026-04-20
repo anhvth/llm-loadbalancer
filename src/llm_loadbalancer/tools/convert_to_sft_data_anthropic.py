@@ -10,7 +10,9 @@ _BILLING_HEADER_PREFIX = "x-anthropic-billing-header:"
 
 def _strip_billing_header(text: str) -> str:
     if text.startswith(_BILLING_HEADER_PREFIX):
-        return text[len(_BILLING_HEADER_PREFIX):].lstrip()
+        # The billing header includes per-request hashes (e.g. cch=...).
+        # Keeping it breaks prefix-based deduplication across turns.
+        return ""
     return text
 
 
@@ -166,14 +168,23 @@ def convert_claude_code_record(record, include_output=False):
         content = []
         for block in system_blocks:
             if isinstance(block, str):
-                content.append(text_item(_strip_billing_header(block)))
+                stripped = _strip_billing_header(block)
+                if not stripped:
+                    continue
+                content.append(text_item(stripped))
             elif isinstance(block, dict) and block.get("type") == "text":
-                content.append({"type": "text", "text": _strip_billing_header(block.get("text", ""))})
+                stripped = _strip_billing_header(block.get("text", ""))
+                if not stripped:
+                    continue
+                content.append({"type": "text", "text": stripped})
             elif isinstance(block, dict):
                 # fallback: stringify unknown system items
                 content.append(text_item(json.dumps(block, ensure_ascii=False)))
             else:
                 content.append(text_item(str(block)))
+
+        if not content:
+            return
 
         out["messages"].append(
             {
@@ -314,6 +325,8 @@ def convert_claude_code_record(record, include_output=False):
                     for block in content
                 ]
             rendered = normalize_renderable_content(content)
+            if rendered == "":
+                continue
             if out["messages"] and out["messages"][0]["role"] == "system":
                 existing = out["messages"][0]["content"]
                 if isinstance(existing, str):

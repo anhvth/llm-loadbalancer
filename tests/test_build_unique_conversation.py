@@ -390,3 +390,31 @@ def test_openai_new_conversation_same_hi_keeps_two_conversations():
 
     kept = group_by_session_then_dedupe([row0, row1, row2], _FakeTokenizer())
     assert len(kept) == 2
+
+
+def test_group_by_session_then_dedupe_returns_oldest_first_by_timestamp():
+    class _FakeTokenizer:
+        def apply_chat_template(
+            self, messages, tools=None, tokenize=False, add_generation_prompt=False
+        ):
+            rendered = []
+            for message in messages:
+                rendered.append(
+                    f"<|im_start|>{message['role']}\n{message['content']}<|im_end|>\n"
+                )
+            return "".join(rendered)
+
+    old = {
+        "timestamp": "2026-04-20T01:00:00+00:00",
+        "input": {"messages": [{"role": "user", "content": "old"}]},
+        "output": {"choices": [{"message": {"role": "assistant", "content": "a"}}]},
+    }
+    new = {
+        "timestamp": "2026-04-20T02:00:00+00:00",
+        "input": {"messages": [{"role": "user", "content": "new"}]},
+        "output": {"choices": [{"message": {"role": "assistant", "content": "b"}}]},
+    }
+
+    kept = group_by_session_then_dedupe([new, old], _FakeTokenizer())
+    assert kept[0][0]["content"] == "old"
+    assert kept[1][0]["content"] == "new"
