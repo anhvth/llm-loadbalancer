@@ -14,7 +14,10 @@ import argparse
 import json
 import sys
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any, Sequence, TypeAlias
+
+SftMessages: TypeAlias = list[dict[str, str]]
+GroupKey: TypeAlias = str  # timestamp string used as sort key
 
 from tqdm import tqdm
 
@@ -122,7 +125,7 @@ def group_by_session_then_dedupe(
     records: list[dict[str, Any]],
     tokenizer: Any,
     include_timestamps: bool = False,
-) -> list[list[dict[str, str]]] | list[tuple[list[dict[str, str]], str]]:
+) -> list[SftMessages] | list[tuple[SftMessages, GroupKey]]:
     """Convert every row to prompt first, drop prefix snapshots, then dedupe."""
     prompt_entries: list[tuple[str, str]] = []
     for record in tqdm(records, desc="Rows to prompts"):

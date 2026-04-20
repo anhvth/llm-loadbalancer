@@ -1,3 +1,5 @@
+from typing import cast
+
 from llm_loadbalancer.tools.build_unique_conversation import (
     deduplicate_by_rendered_prompt,
     _convert_row,
@@ -415,6 +417,6 @@ def test_group_by_session_then_dedupe_returns_oldest_first_by_timestamp():
         "output": {"choices": [{"message": {"role": "assistant", "content": "b"}}]},
     }
 
-    kept = group_by_session_then_dedupe([new, old], _FakeTokenizer())
+    kept = cast(list[list[dict[str, str]]], group_by_session_then_dedupe([new, old], _FakeTokenizer()))
     assert kept[0][0]["content"] == "old"
     assert kept[1][0]["content"] == "new"
