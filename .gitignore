@@ -13,3 +13,4 @@ wheels/
 .venv
 llm_*logs/
 llm_loadbalancer_affinity.sqlite3*
+.agents
