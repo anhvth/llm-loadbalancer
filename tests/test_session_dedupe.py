@@ -1,40 +1,25 @@
-"""Tests for Anthropic session_id-based conversation deduplication."""
-
-import json
-
-import pytest
+"""Regression tests for prompt-based conversation deduplication."""
 
 from llm_loadbalancer.tools.build_unique_conversation import (
-    extract_anthropic_session_id,
-    _select_best_record,
     group_by_session_then_dedupe,
     deduplicate_by_rendered_prompt,
 )
 
 
-def _make_anthropic_record(
-    session_id: str,
+def _make_record(
     messages: list[dict],
     timestamp: str = "2026-04-20T00:00:00+00:00",
-    output: dict | None = None,
 ) -> dict:
-    """Build a minimal Anthropic-style collected record with session_id."""
-    metadata_user_id = json.dumps({
-        "device_id": "test-device",
-        "account_uuid": "",
-        "session_id": session_id,
-    })
-    rec = {
+    return {
         "id": "test",
         "timestamp": timestamp,
         "input": {
             "messages": messages,
-            "metadata": {"user_id": metadata_user_id},
+        },
+        "output": {
+            "content": [{"type": "text", "text": "resp"}],
         },
     }
-    if output is not None:
-        rec["output"] = output
-    return rec
 
 
 class _FakeTokenizer:
@@ -47,163 +32,49 @@ class _FakeTokenizer:
         )
 
 
-# --- extract_anthropic_session_id ---
-
-def test_extract_session_id_valid():
-    rec = _make_anthropic_record("abc-123", [{"role": "user", "content": "hi"}])
-    assert extract_anthropic_session_id(rec) == "abc-123"
-
-
-def test_extract_session_id_missing_metadata():
-    rec = {"input": {"messages": [{"role": "user", "content": "hi"}]}}
-    assert extract_anthropic_session_id(rec) is None
-
-
-def test_extract_session_id_malformed_user_id():
-    rec = {
-        "input": {
-            "messages": [{"role": "user", "content": "hi"}],
-            "metadata": {"user_id": "not-json"},
-        }
-    }
-    assert extract_anthropic_session_id(rec) is None
-
-
-def test_extract_session_id_no_session_id_key():
-    rec = {
-        "input": {
-            "messages": [{"role": "user", "content": "hi"}],
-            "metadata": {"user_id": json.dumps({"device_id": "x"})},
-        }
-    }
-    assert extract_anthropic_session_id(rec) is None
-
-
-def test_extract_session_id_empty_string():
-    rec = {
-        "input": {
-            "messages": [{"role": "user", "content": "hi"}],
-            "metadata": {"user_id": json.dumps({"session_id": ""})},
-        }
-    }
-    assert extract_anthropic_session_id(rec) is None
-
-
-def test_extract_session_id_bare_payload():
-    """Works when record is a bare payload (no wrapping 'input' key)."""
-    rec = {
-        "messages": [{"role": "user", "content": "hi"}],
-        "metadata": {"user_id": json.dumps({"session_id": "s1"})},
-    }
-    assert extract_anthropic_session_id(rec) == "s1"
-
-
-# --- _select_best_record ---
-
-def test_select_best_record_prefers_longest_messages():
-    r1 = _make_anthropic_record("s1", [{"role": "user", "content": "a"}])
-    r2 = _make_anthropic_record(
-        "s1",
-        [
-            {"role": "user", "content": "a"},
-            {"role": "assistant", "content": "b"},
-            {"role": "user", "content": "c"},
-        ],
-    )
-    assert _select_best_record([r1, r2]) is r2
-
-
-def test_select_best_record_breaks_tie_by_timestamp():
-    r1 = _make_anthropic_record(
-        "s1",
-        [{"role": "user", "content": "a"}],
-        timestamp="2026-04-20T00:00:01+00:00",
-    )
-    r2 = _make_anthropic_record(
-        "s1",
-        [{"role": "user", "content": "a"}],
-        timestamp="2026-04-20T00:00:02+00:00",
-    )
-    assert _select_best_record([r1, r2]) is r2
-
-
-def test_select_best_record_prefers_with_output():
-    r1 = _make_anthropic_record("s1", [{"role": "user", "content": "a"}])
-    r2 = _make_anthropic_record(
-        "s1",
-        [{"role": "user", "content": "a"}],
-        output={"content": [{"type": "text", "text": "resp"}]},
-    )
-    assert _select_best_record([r1, r2]) is r2
-
-
-# --- group_by_session_then_dedupe ---
-
-def test_same_session_collapses_to_one():
-    """Same-session rows are post-hoc deduped; non-prefix variants remain."""
+def test_prompt_prefix_snapshots_collapsed():
+    """Strict prompt-prefix snapshots are collapsed to the longer one."""
     records = [
-        _make_anthropic_record("s1", [{"role": "user", "content": "a"}], timestamp="2026-04-20T00:00:01+00:00"),
-        _make_anthropic_record("s1", [{"role": "user", "content": "a"}, {"role": "assistant", "content": "b"}, {"role": "user", "content": "c"}], timestamp="2026-04-20T00:00:02+00:00"),
-        _make_anthropic_record("s1", [{"role": "user", "content": "x"}], timestamp="2026-04-20T00:00:03+00:00"),
+        {
+            "timestamp": "2026-04-20T00:00:01+00:00",
+            "input": {"messages": [{"role": "user", "content": "a"}]},
+            "output": {"content": [{"type": "text", "text": "b"}]},
+        },
+        {
+            "timestamp": "2026-04-20T00:00:02+00:00",
+            "input": {
+                "messages": [
+                    {"role": "user", "content": "a"},
+                    {"role": "assistant", "content": "b"},
+                    {"role": "user", "content": "c"},
+                ]
+            },
+            "output": {"content": [{"type": "text", "text": "d"}]},
+        },
+        _make_record([{"role": "user", "content": "x"}], timestamp="2026-04-20T00:00:03+00:00"),
     ]
     kept = group_by_session_then_dedupe(records, _FakeTokenizer())
     assert len(kept) == 2
 
 
-def test_different_sessions_remain_separate():
-    """Records with different session_ids produce separate SFT rows."""
+def test_non_prefix_histories_remain_separate():
     records = [
-        _make_anthropic_record("s1", [{"role": "user", "content": "hello"}]),
-        _make_anthropic_record("s2", [{"role": "user", "content": "world"}]),
+        _make_record([{"role": "user", "content": "hello"}]),
+        _make_record([{"role": "user", "content": "world"}]),
     ]
     kept = group_by_session_then_dedupe(records, _FakeTokenizer())
     assert len(kept) == 2
 
 
-def test_no_session_falls_back_to_prompt_dedupe():
-    """Records without session_id use rendered-prompt deduplication."""
+def test_exact_duplicate_rows_collapsed():
     r1 = {"input": {"messages": [{"role": "user", "content": "hi"}]}}
     r2 = {"input": {"messages": [{"role": "user", "content": "hi"}]}}
     r3 = {"input": {"messages": [{"role": "user", "content": "bye"}]}}
     kept = group_by_session_then_dedupe([r1, r2, r3], _FakeTokenizer())
-    # r1 and r2 are exact duplicates, r3 is different
     assert len(kept) == 2
 
 
-def test_mixed_session_and_no_session():
-    """Session-grouped and non-session records are both handled."""
-    records = [
-        _make_anthropic_record("s1", [{"role": "user", "content": "a"}]),
-        _make_anthropic_record("s1", [{"role": "user", "content": "a"}, {"role": "assistant", "content": "b"}, {"role": "user", "content": "c"}]),
-        {"input": {"messages": [{"role": "user", "content": "standalone"}]}},
-    ]
-    kept = group_by_session_then_dedupe(records, _FakeTokenizer())
-    # 1 from session s1, 1 from standalone
-    assert len(kept) == 2
-
-
-def test_representative_picks_richest():
-    """The representative from a session group is the one with the most messages."""
-    r_short = _make_anthropic_record("s1", [{"role": "user", "content": "a"}])
-    r_long = _make_anthropic_record(
-        "s1",
-        [
-            {"role": "user", "content": "a"},
-            {"role": "assistant", "content": "b"},
-            {"role": "user", "content": "c"},
-            {"role": "assistant", "content": "d"},
-            {"role": "user", "content": "e"},
-        ],
-    )
-    kept = group_by_session_then_dedupe([r_short, r_long], _FakeTokenizer())
-    assert len(kept) == 1
-    # The kept conversation should have content from the longer record
-    all_content = " ".join(m.get("content", "") for m in kept[0])
-    assert "e" in all_content
-
-
-def test_malformed_metadata_falls_back():
-    """Malformed metadata.user_id does not crash; falls back to prompt dedupe."""
+def test_malformed_metadata_is_ignored():
     records = [
         {
             "input": {
