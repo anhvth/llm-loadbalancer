@@ -1793,11 +1793,13 @@ name = "llm-loadbalancer"
 version = "0.1.0"
 source = { editable = "." }
 dependencies = [
+    { name = "fastapi" },
     { name = "httpx" },
     { name = "loguru" },
     { name = "pytest" },
     { name = "speedy-utils" },
     { name = "tabulate" },
+    { name = "tqdm" },
     { name = "transformers" },
     { name = "uvicorn" },
 ]
@@ -1809,11 +1811,13 @@ dev = [
 
 [package.metadata]
 requires-dist = [
+    { name = "fastapi", specifier = ">=0.115.0" },
     { name = "httpx", specifier = ">=0.28.1" },
     { name = "loguru", specifier = ">=0.7.3" },
     { name = "pytest", specifier = ">=9.0.3" },
     { name = "speedy-utils", editable = "../speedy_utils" },
     { name = "tabulate", specifier = ">=0.9.0" },
+    { name = "tqdm", specifier = ">=4.67.1" },
     { name = "transformers", specifier = ">=5.5.4" },
     { name = "uvicorn", specifier = ">=0.44.0" },
 ]

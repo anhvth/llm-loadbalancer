@@ -5,18 +5,19 @@ description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
+    "fastapi>=0.115.0",
     "httpx>=0.28.1",
     "loguru>=0.7.3",
     "pytest>=9.0.3",
     "speedy-utils",
     "tabulate>=0.9.0",
+    "tqdm>=4.67.1",
     "transformers>=5.5.4",
     "uvicorn>=0.44.0",
 ]
 
 [project.scripts]
-cat_db = "cat_db:main"
-llm-proxy = "main:main"
+llm-proxy = "llm_loadbalancer.cli:main"
 collect-jsonl = "llm_loadbalancer.tools.collect_jsonl:main"
 build-unique-sft = "llm_loadbalancer.tools.build_unique_conversation:main"
 annotate-full-conversations = "llm_loadbalancer.tools.annotate_full_conversations:main"
@@ -35,24 +36,16 @@ speedy-utils = { path = "../speedy_utils", editable = true }
 [tool.hatch.build.targets.wheel]
 sources = ["src"]
 only-include = [
-    "cat_db.py",
-    "main.py",
-    "keep_connection.py",
-    "load_balancer.py",
-    "load_balancer_v2.py",
-    "src/llm_loadbalancer/__init__.py",
-    "src/llm_loadbalancer/tools/__init__.py",
-    "src/llm_loadbalancer/tools/collect_jsonl.py",
-    "src/llm_loadbalancer/tools/build_unique_conversation.py",
-    "src/llm_loadbalancer/tools/annotate_full_conversations.py",
-    "src/llm_loadbalancer/tools/convert_to_sft_data.py",
-    "src/llm_loadbalancer/tools/convert_to_sft_data_anthropic.py",
-    "src/llm_loadbalancer/tools/convert_to_sft_data_openai.py",
-    "src/llm_loadbalancer/tools/cat_sft_messages.py",
+    "src/llm_loadbalancer",
 ]
 
 [tool.pytest.ini_options]
 pythonpath = ["src"]
+testpaths = ["tests"]
+filterwarnings = [
+    "ignore::DeprecationWarning:websockets\\.legacy",
+    "ignore::DeprecationWarning:uvicorn\\.protocols\\.websockets\\.websockets_impl",
+]
 
 [dependency-groups]
 dev = [

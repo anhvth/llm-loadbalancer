@@ -1,6 +1,7 @@
 import json
 from pathlib import Path
 
+import pytest
 
 from llm_loadbalancer.tools import collect_jsonl
 
@@ -35,7 +36,6 @@ def test_convert_file_exports_id_timestamp_input_output(tmp_path: Path):
     assert row["timestamp"] is not None
     assert row["input"]["messages"][0]["role"] == "user"
     assert row["output"]["content"][0]["text"] == "a.txt and b.txt"
-    # No top-level SFT keys
     assert "messages" not in row or row.get("messages") is None or isinstance(row.get("input"), dict)
     assert "tools" not in row
 
@@ -64,3 +64,38 @@ def test_convert_file_bare_payload_with_messages(tmp_path: Path):
     row = json.loads(payload)
     assert row["input"] == bare
     assert row["output"] is None
+
+
+def test_main_collects_request_files_from_package_path(tmp_path: Path):
+    requests_dir = tmp_path / "logs" / "requests"
+    export_dir = tmp_path / "training-data"
+    sample = requests_dir / "request-001.json"
+    requests_dir.mkdir(parents=True)
+    sample.write_text(json.dumps(_payload_with_messages()), encoding="utf-8")
+
+    result = collect_jsonl.main([
+        "--requests-dir",
+        str(requests_dir),
+        "--export-dir",
+        str(export_dir),
+    ])
+
+    export_path = export_dir / "collected.jsonl"
+    lines = export_path.read_text(encoding="utf-8").splitlines()
+
+    assert result == 0
+    assert not sample.exists()
+    assert len(lines) == 1
+    row = json.loads(lines[0])
+    assert row["id"] == "request-001"
+    assert row["input"]["messages"][0]["content"] == "What files are in /tmp?"
+    assert row["output"]["content"][0]["text"] == "a.txt and b.txt"
+
+
+def test_collect_jsonl_help_has_no_state_db_option(capsys):
+    with pytest.raises(SystemExit) as exc_info:
+        collect_jsonl.main(["--help"])
+
+    captured = capsys.readouterr()
+    assert exc_info.value.code == 0
+    assert "--state-db" not in captured.out

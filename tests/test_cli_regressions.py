@@ -1,10 +1,6 @@
-import pathlib
-import json
 import subprocess
 
-import cat_db
-import keep_connection
-import main
+from llm_loadbalancer import cli as main, keep_connection
 
 
 def test_default_config_path_uses_cache_directory(monkeypatch, tmp_path):
@@ -177,6 +173,29 @@ def test_start_everything_skips_tmux_for_direct_setup(monkeypatch, tmp_path):
     assert seen == [(config_path, False)]
 
 
+def test_start_everything_returns_failure_when_tmux_launch_fails(monkeypatch, tmp_path):
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(main.DEFAULT_CONFIG)
+    logs = []
+    served = []
+
+    monkeypatch.setattr(
+        main,
+        "launch_in_tmux",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            subprocess.CalledProcessError(1, ["tmux", "new-session"])
+        ),
+    )
+    monkeypatch.setattr(main, "serve_forever", lambda *args, **kwargs: served.append("serve"))
+    monkeypatch.setattr(main.logger, "error", lambda message, *args: logs.append(message.format(*args)))
+
+    result = main.start_everything(config_path)
+
+    assert result == 1
+    assert served == []
+    assert any("Failed to start tmux command" in line for line in logs)
+
+
 def test_start_everything_logs_config_path_and_table(monkeypatch, tmp_path):
     config_path = tmp_path / "config.yaml"
     config_path.write_text(main.DEFAULT_CONFIG)
@@ -280,175 +299,31 @@ def test_llm_proxy_entrypoint_is_available():
     assert "usage: llm-proxy" in result.stdout
 
 
-def write_log_dir(log_dir: pathlib.Path, rows: list[tuple[str, str, str]]):
-    requests_dir = log_dir / "requests"
-    requests_dir.mkdir(parents=True, exist_ok=True)
-    for index, (input_text, output_text, endpoint_used) in enumerate(rows, start=1):
-        (requests_dir / f"{index:06d}.json").write_text(
-            json.dumps(
-                {
-                    "input": input_text,
-                    "output": output_text,
-                    "endpoint_used": endpoint_used,
-                }
-            ),
-            encoding="utf-8",
+def test_packaged_cli_module_help_is_available():
+    result = subprocess.run(
+        ["uv", "run", "python", "-m", "llm_loadbalancer.cli", "--help"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0
+    assert "usage:" in result.stdout.lower()
+
+
+def test_packaged_console_scripts_are_available():
+    for command in (
+        "collect-jsonl",
+        "build-unique-sft",
+        "annotate-full-conversations",
+        "cat_sft_messages",
+    ):
+        result = subprocess.run(
+            ["uv", "run", command, "--help"],
+            capture_output=True,
+            text=True,
+            check=False,
         )
 
-
-def test_cat_db_uses_default_cache_path(monkeypatch, tmp_path, capsys):
-    db_path = tmp_path / "cache-home" / ".cache" / "llm-proxy" / "logs"
-    monkeypatch.setenv("HOME", str(tmp_path / "cache-home"))
-    write_log_dir(
-        db_path,
-        [('{"a":1}', '{"b":2}', "http://127.0.0.1:18000/v1/chat/completions")],
-    )
-
-    result = cat_db.main([])
-
-    captured = capsys.readouterr()
-    assert result == 0
-    assert captured.err == ""
-    assert "Row 1" in captured.out
-    assert "endpoint_used: http://127.0.0.1:18000/v1/chat/completions" in captured.out
-    assert "input:" in captured.out
-    assert '"a": 1' in captured.out
-    assert "output:" in captured.out
-    assert '"b": 2' in captured.out
-
-
-def test_cat_db_defaults_to_example_config_path(tmp_path, monkeypatch):
-    monkeypatch.chdir(tmp_path)
-    (tmp_path / "example_config.yaml").write_text(
-        "\n".join(
-            [
-                "endpoints:",
-                "  - worker-[41,45,49,53-54,57,59]:8000",
-                "port:",
-                "  - 8001",
-                "load-balancer:",
-                "  log-dir: ~/.cache/llm-proxy/logs",
-                "",
-            ]
-        )
-    )
-
-    assert cat_db.default_log_dir() == pathlib.Path("~/.cache/llm-proxy/logs").expanduser()
-
-
-def test_cat_db_accepts_explicit_db_path(tmp_path, capsys):
-    db_path = tmp_path / "custom-logs"
-    write_log_dir(
-        db_path,
-        [
-            ('{"a":1}', '{"b":2}', "http://127.0.0.1:18000/v1/chat/completions"),
-            ('{"a":2}', '{"b":3}', "http://127.0.0.1:18001/v1/chat/completions"),
-        ],
-    )
-
-    result = cat_db.main(["--raw", str(db_path)])
-
-    captured = capsys.readouterr()
-    lines = captured.out.splitlines()
-    assert result == 0
-    assert captured.err == ""
-    assert [json.loads(line) for line in lines] == [
-        {
-            "id": 1,
-            "input": '{"a":1}',
-            "output": '{"b":2}',
-            "endpoint_used": "http://127.0.0.1:18000/v1/chat/completions",
-        },
-        {
-            "id": 2,
-            "input": '{"a":2}',
-            "output": '{"b":3}',
-            "endpoint_used": "http://127.0.0.1:18001/v1/chat/completions",
-        },
-    ]
-
-
-def test_cat_db_render_row_pretty_formats_messages_readably():
-    row = (
-        7,
-        json.dumps(
-            {
-                "model": "demo",
-                "messages": [
-                    {"role": "system", "content": "be concise"},
-                    {"role": "user", "content": "hello"},
-                ],
-            }
-        ),
-        json.dumps({"id": "resp_1", "choices": [{"message": {"role": "assistant", "content": "hi"}}]}),
-        "http://127.0.0.1:18000/v1/chat/completions",
-    )
-
-    rendered = cat_db.render_row_pretty(row)
-
-    assert "Row 7" in rendered
-    assert "input:" in rendered
-    assert "messages:" in rendered
-    assert "[1] system" in rendered
-    assert "content: be concise" in rendered
-    assert "[2] user" in rendered
-    assert "content: hello" in rendered
-    assert "output:" in rendered
-    assert '"id": "resp_1"' in rendered
-
-
-def test_cat_db_uses_non_interactive_output_when_stdout_is_not_a_tty(monkeypatch, tmp_path, capsys):
-    db_path = tmp_path / "custom-logs"
-    write_log_dir(
-        db_path,
-        [('{"a":1}', '{"b":2}', "http://127.0.0.1:18000/v1/chat/completions")],
-    )
-    monkeypatch.setattr(cat_db.sys.stdout, "isatty", lambda: False)
-
-    result = cat_db.main([str(db_path)])
-
-    captured = capsys.readouterr()
-    assert result == 0
-    assert captured.err == ""
-    assert "Navigation" not in captured.out
-    assert "Row 1" in captured.out
-
-
-class _FakeStdin:
-    def __init__(self, reads):
-        self._reads = list(reads)
-
-    def fileno(self):
-        return 0
-
-    def read(self, _size):
-        result = self._reads.pop(0)
-        if isinstance(result, BaseException):
-            raise result
-        return result
-
-
-def test_cat_db_read_key_maps_uppercase_g_to_end(monkeypatch):
-    monkeypatch.setattr(cat_db, "termios", type("FakeTermios", (), {"tcgetattr": staticmethod(lambda fd: "state"), "tcsetattr": staticmethod(lambda fd, when, state: None), "TCSADRAIN": object()})())
-    monkeypatch.setattr(cat_db, "tty", type("FakeTty", (), {"setraw": staticmethod(lambda fd: None)})())
-    monkeypatch.setattr(cat_db.sys, "stdin", _FakeStdin(["G"]))
-
-    assert cat_db.read_key() == "end"
-
-
-def test_cat_db_read_key_maps_double_g_to_home(monkeypatch):
-    monkeypatch.setattr(cat_db, "termios", type("FakeTermios", (), {"tcgetattr": staticmethod(lambda fd: "state"), "tcsetattr": staticmethod(lambda fd, when, state: None), "TCSADRAIN": object()})())
-    monkeypatch.setattr(cat_db, "tty", type("FakeTty", (), {"setraw": staticmethod(lambda fd: None)})())
-    monkeypatch.setattr(cat_db.sys, "stdin", _FakeStdin(["g", "g"]))
-    monkeypatch.setattr(cat_db.fcntl, "fcntl", lambda fd, op, arg=None: 0)
-
-    assert cat_db.read_key() == "home"
-
-
-def test_cat_db_read_key_handles_single_g_without_crashing(monkeypatch):
-    monkeypatch.setattr(cat_db, "termios", type("FakeTermios", (), {"tcgetattr": staticmethod(lambda fd: "state"), "tcsetattr": staticmethod(lambda fd, when, state: None), "TCSADRAIN": object()})())
-    monkeypatch.setattr(cat_db, "tty", type("FakeTty", (), {"setraw": staticmethod(lambda fd: None)})())
-    monkeypatch.setattr(cat_db.sys, "stdin", _FakeStdin(["g", BlockingIOError()]))
-    monkeypatch.setattr(cat_db.fcntl, "fcntl", lambda fd, op, arg=None: 0)
-
-    assert cat_db.read_key() == "g"
+        assert result.returncode == 0, (command, result.stderr)
+        assert "usage:" in result.stdout.lower()

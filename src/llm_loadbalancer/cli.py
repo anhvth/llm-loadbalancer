@@ -9,8 +9,8 @@ import sys
 
 from loguru import logger
 
-from keep_connection import iter_commands, launch_in_tmux, parse_config, uses_ssh_tunnels
-from load_balancer import serve_forever
+from llm_loadbalancer.keep_connection import iter_commands, launch_in_tmux, parse_config, uses_ssh_tunnels
+from llm_loadbalancer.load_balancer import serve_forever
 
 logger.remove()
 
@@ -121,11 +121,18 @@ def start_everything(
     logger.info("Using config file: {}", config_path)
     logger.info("Loaded config:\n{}", format_config_table(config_path, cfg))
     commands = list(iter_commands(cfg))
-    if uses_ssh_tunnels(cfg):
-        launch_in_tmux(cfg.tmux_session_name, commands)
-        logger.info("Started SSH tunnels in tmux session: {}", cfg.tmux_session_name)
-    else:
-        logger.info("Using direct upstream connections; skipping SSH tunnel startup")
+    try:
+        if uses_ssh_tunnels(cfg):
+            launch_in_tmux(cfg.tmux_session_name, commands)
+            logger.info("Started SSH tunnels in tmux session: {}", cfg.tmux_session_name)
+        else:
+            logger.info("Using direct upstream connections; skipping SSH tunnel startup")
+    except subprocess.CalledProcessError as exc:
+        logger.error("Failed to start tmux command: {}", exc)
+        return 1
+    except RuntimeError as exc:
+        logger.error("{}", exc)
+        return 1
     if routing is None:
         serve_forever(config_path, verbose=verbose)
     else:

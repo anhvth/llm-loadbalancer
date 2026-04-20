@@ -16,9 +16,9 @@ import httpx
 import pytest
 import uvicorn
 
-from keep_connection import parse_config
-import load_balancer
-from load_balancer import create_app
+from llm_loadbalancer.keep_connection import parse_config
+import llm_loadbalancer.load_balancer as load_balancer
+from llm_loadbalancer.load_balancer import create_app
 
 
 class ReusableThreadingHTTPServer(ThreadingHTTPServer):
@@ -381,13 +381,20 @@ def test_create_app_probes_v1_models_when_health_path_has_no_models(tmp_path: Pa
 
 
 def test_refresh_health_keeps_working_endpoints_and_warns_on_dead_ones(
-    monkeypatch, tmp_path: Path, capsys
+    monkeypatch, tmp_path: Path
 ):
     config_path = tmp_path / "config.yaml"
     upstream_ports = find_free_port_block(2)
     write_config(config_path, upstream_ports, 8001)
     config_path.write_text(config_path.read_text() + f"  log-dir: {tmp_path / 'logs-a'}\n")
     monkeypatch.setattr(load_balancer, "HEALTHCHECK_TIMEOUT_SECONDS", 0.05)
+    logs: list[str] = []
+
+    monkeypatch.setattr(
+        load_balancer.logger,
+        "info",
+        lambda message, *args: logs.append(message.format(*args)),
+    )
 
     def start_server(port: int):
         server = ReusableThreadingHTTPServer(("127.0.0.1", port), StubHandler)
@@ -401,22 +408,28 @@ def test_refresh_health_keeps_working_endpoints_and_warns_on_dead_ones(
     try:
         app = load_balancer.create_app(config_path)
         assert [endpoint.port for endpoint in app.valid_endpoints] == upstream_ports
+        logs.clear()
 
         server_two.shutdown()
         server_two.server_close()
         thread_two.join(timeout=5)
 
         asyncio.run(app.refresh_health())
-        captured = capsys.readouterr()
+        rendered = "\n".join(logs)
 
-        assert "endpoint" in captured.err
-        assert "status" in captured.err
-        assert "requests" in captured.err
-        assert f"worker-1:8000 (local {upstream_ports[0]})" in captured.err
-        assert f"worker-2:8000 (local {upstream_ports[1]})" in captured.err
-        assert "UP" in captured.err
-        assert "DOWN" in captured.err
-        assert "Connection refused" in captured.err
+        # Compact grouped format: MODEL, UP/TOTAL, REQS, ERR, ENDPOINTS
+        assert "MODEL" in rendered
+        assert "UP/TOTAL" in rendered
+        assert "REQS" in rendered
+        assert "ERR" in rendered
+        assert "ENDPOINTS" in rendered
+        # Worker endpoints appear in ENDPOINTS column (unsorted within group)
+        assert f"worker-1:8000 (local {upstream_ports[0]})" in rendered
+        assert f"worker-2:8000 (local {upstream_ports[1]})" in rendered
+        # One worker down, one up: shows 1/2
+        assert "1/2" in rendered
+        # One error (Connection refused)
+        assert "1" in rendered
         assert [endpoint.port for endpoint in app.valid_endpoints] == [upstream_ports[0]]
     finally:
         server_one.shutdown()
@@ -431,17 +444,23 @@ def test_refresh_health_keeps_working_endpoints_and_warns_on_dead_ones(
 
 
 def test_refresh_health_keeps_last_known_endpoints_when_all_checks_fail(
-    monkeypatch, tmp_path: Path, capsys
+    monkeypatch, tmp_path: Path
 ):
     config_path = tmp_path / "config.yaml"
     upstream_ports = find_free_port_block(2)
     write_config(config_path, upstream_ports, 8001)
     config_path.write_text(config_path.read_text() + f"  log-dir: {tmp_path / 'logs-brownout'}\n")
+    logs: list[str] = []
 
     initial_endpoints = [
         load_balancer.EndpointCheckResult(host=f"worker-{index + 1}", port=port)
         for index, port in enumerate(upstream_ports)
     ]
+    monkeypatch.setattr(
+        load_balancer.logger,
+        "info",
+        lambda message, *args: logs.append(message.format(*args)),
+    )
     monkeypatch.setattr(
         load_balancer.LoadBalancerApp,
         "_initial_healthcheck",
@@ -459,22 +478,30 @@ def test_refresh_health_keeps_last_known_endpoints_when_all_checks_fail(
     monkeypatch.setattr(load_balancer.LoadBalancerApp, "_check_endpoint_async", failing_check)
 
     app = load_balancer.create_app(config_path)
-    capsys.readouterr()
+    logs.clear()
 
     asyncio.run(app.refresh_health())
-    captured = capsys.readouterr()
+    rendered = "\n".join(logs)
 
     assert [endpoint.port for endpoint in app.valid_endpoints] == upstream_ports
-    assert "DOWN" in captured.err
-    assert "Healthcheck timeout" in captured.err
+    # Compact format: all workers show 0/2 UP, 2 total, 2 errors
+    assert "0/2" in rendered
+    assert "MODEL" in rendered
 
 
-def test_refresh_health_logs_only_on_information_gain(monkeypatch, tmp_path: Path, capsys):
+def test_refresh_health_logs_only_on_information_gain(monkeypatch, tmp_path: Path):
     config_path = tmp_path / "config.yaml"
     upstream_ports = find_free_port_block(2)
     write_config(config_path, upstream_ports, 8001)
     config_path.write_text(config_path.read_text() + f"  log-dir: {tmp_path / 'logs-b'}\n")
     monkeypatch.setattr(load_balancer, "HEALTHCHECK_TIMEOUT_SECONDS", 0.05)
+    logs: list[str] = []
+
+    monkeypatch.setattr(
+        load_balancer.logger,
+        "info",
+        lambda message, *args: logs.append(message.format(*args)),
+    )
 
     server_one = ReusableThreadingHTTPServer(("127.0.0.1", upstream_ports[0]), StubHandler)
     thread_one = threading.Thread(target=server_one.serve_forever, daemon=True)
@@ -482,35 +509,42 @@ def test_refresh_health_logs_only_on_information_gain(monkeypatch, tmp_path: Pat
     wait_for_port(upstream_ports[0])
     try:
         app = load_balancer.create_app(config_path)
-        capsys.readouterr()
+        logs.clear()
 
         asyncio.run(app.refresh_health())
-        captured = capsys.readouterr()
-        assert captured.err == ""
+        assert logs == []
     finally:
         server_one.shutdown()
         server_one.server_close()
         thread_one.join(timeout=5)
 
 
-def test_refresh_health_table_includes_request_counts(tmp_path: Path, capsys):
+def test_refresh_health_table_includes_request_counts(monkeypatch, tmp_path: Path):
     config_path = tmp_path / "config.yaml"
     upstream_ports = find_free_port_block(1)
     write_config(config_path, upstream_ports, 8001)
     config_path.write_text(config_path.read_text() + f"  log-dir: {tmp_path / 'logs-c'}\n")
+    logs: list[str] = []
+
+    monkeypatch.setattr(
+        load_balancer.logger,
+        "info",
+        lambda message, *args: logs.append(message.format(*args)),
+    )
 
     with run_stub_server(upstream_ports[0]):
         app = load_balancer.create_app(config_path)
-        capsys.readouterr()
+        logs.clear()
         endpoint_label = app.upstream_endpoint_labels[("worker-1", upstream_ports[0])]
         app.endpoint_request_counts[endpoint_label] = 5
 
         asyncio.run(app.refresh_health())
-        captured = capsys.readouterr()
+        rendered = "\n".join(logs)
 
-    assert "requests" in captured.err
-    assert f"{endpoint_label}" in captured.err
-    assert "  5  " in captured.err
+    # Compact format uses REQS column
+    assert "REQS" in rendered
+    assert f"{endpoint_label}" in rendered
+    assert "5" in rendered
 
 
 def test_check_endpoint_sync_retries_transient_connection_errors(monkeypatch):
@@ -660,13 +694,20 @@ def test_logs_assign_incrementing_ids(tmp_path: Path):
     assert [row[0] for row in rows] == [1, 2]
 
 
-def test_verbose_prints_pretty_logged_payload(tmp_path: Path, capsys):
+def test_verbose_prints_pretty_logged_payload(monkeypatch, tmp_path: Path, capsys):
     config_path = tmp_path / "config.yaml"
     db_path = tmp_path / "request_logs"
     upstream_ports = find_free_port_block(1)
     write_config(config_path, upstream_ports, 8001)
     config_path.write_text(config_path.read_text() + f"  log-dir: {db_path}\n")
     request_payload = {"model": "demo", "messages": [{"role": "user", "content": "hi"}]}
+    logs: list[str] = []
+
+    monkeypatch.setattr(
+        load_balancer.logger,
+        "info",
+        lambda message, *args: logs.append(message.format(*args)),
+    )
 
     with run_stub_server(upstream_ports[0]), run_load_balancer(config_path, verbose=True) as listen_port:
         conn = http.client.HTTPConnection("127.0.0.1", listen_port, timeout=30)
@@ -682,11 +723,12 @@ def test_verbose_prints_pretty_logged_payload(tmp_path: Path, capsys):
 
     captured = capsys.readouterr()
     assert captured.out == ""
-    assert captured.err.count("[request_response_log]") == 1
-    assert str(db_path / "requests") in captured.err
-    assert f"endpoint=http://127.0.0.1:{upstream_ports[0]}/v1/chat/completions" in captured.err
-    assert '"input": {' not in captured.err
-    assert '"output": {' not in captured.err
+    rendered = "\n".join(logs)
+    assert rendered.count("[request_response_log]") == 1
+    assert str(db_path / "requests") in rendered
+    assert f"endpoint=http://127.0.0.1:{upstream_ports[0]}/v1/chat/completions" in rendered
+    assert '"input": {' not in rendered
+    assert '"output": {' not in rendered
 
 
 def test_verbose_request_response_log_is_rate_limited(monkeypatch, tmp_path: Path):

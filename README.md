@@ -55,8 +55,6 @@ Per-worker upstream connection limits are derived automatically from
 - `uvx --from git+https://github.com/anhvth/llm-loadbalancer llm-proxy --set-config` — create and open `~/.config/llm-proxy.yaml`
 - `uvx --from git+https://github.com/anhvth/llm-loadbalancer llm-proxy` — start the load balancer after config is set
 - `uvx --from git+https://github.com/anhvth/llm-loadbalancer llm-proxy --routing random` — start with pure random routing
-- `uvx --from git+https://github.com/anhvth/llm-loadbalancer cat_db` — inspect the request log directory in an interactive terminal
-- `uvx --from git+https://github.com/anhvth/llm-loadbalancer cat_db --raw` — print one JSON object per line for scripting
 
 ## Request Logging
 
@@ -70,19 +68,3 @@ Completed request/response pairs are written as individual JSON files under
 The request path only enqueues the log record. A background thread writes the
 files, so proxying is not blocked on disk I/O. Message affinity is shared across
 workers through the SQLite database at `affinity-db`.
-
-## Inspect Logged Requests
-
-Use `cat_db` to inspect the request log files with a readable pretty view by default:
-
-```bash
-uvx --from git+https://github.com/anhvth/llm-loadbalancer cat_db
-uvx --from git+https://github.com/anhvth/llm-loadbalancer cat_db /path/to/custom-log-dir
-uvx --from git+https://github.com/anhvth/llm-loadbalancer cat_db --raw
-```
-
-Without an argument, `cat_db` reads `~/.cache/llm-proxy/logs`.
-
-- Default mode formats one request at a time and, in an interactive terminal, lets
-  you move with `Enter`, arrow keys, `j`/`k`, `gg`/`G`, and quit with `q`.
-- Use `--raw` to print one JSON object per line for scripts or piping.
