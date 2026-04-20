@@ -1,3 +1,8 @@
+# AGENTS.md
+
+This project has documentation in `docs/`:
+- `docs/setup.md` — setup and installation instructions
+
 # CLAUDE.md
 
 Behavioral guidelines to reduce common LLM coding mistakes. Merge with project-specific instructions as needed.
