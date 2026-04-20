@@ -1941,11 +1941,43 @@ HTML_TEMPLATE = """
 
       for (const card of nodes.conversationList.querySelectorAll(".conversation-card")) {
         card.addEventListener("click", async () => {
-          state.selectedConversationId = card.dataset.conversationId;
-          renderConversationList();
-          await loadSelectedConversation();
+          await selectConversation(card.dataset.conversationId);
         });
       }
+    }
+
+    async function selectConversation(conversationId) {
+      if (!conversationId || conversationId === state.selectedConversationId) {
+        return;
+      }
+      state.selectedConversationId = conversationId;
+      renderConversationList();
+      for (const card of nodes.conversationList.querySelectorAll(".conversation-card")) {
+        if (card.dataset.conversationId === conversationId) {
+          card.scrollIntoView({ block: "nearest" });
+          break;
+        }
+      }
+      await loadSelectedConversation();
+    }
+
+    async function selectConversationByOffset(offset) {
+      if (!state.conversations.length) {
+        return;
+      }
+      const currentIndex = state.conversations.findIndex(
+        (item) => item.conversation_id === state.selectedConversationId,
+      );
+      const nextIndex =
+        currentIndex === -1
+          ? 0
+          : (currentIndex + offset + state.conversations.length) % state.conversations.length;
+      await selectConversation(state.conversations[nextIndex].conversation_id);
+    }
+
+    function isTypingTarget(target) {
+      return target instanceof Element &&
+        target.closest("input, textarea, select, [contenteditable='true']");
     }
 
     function renderConversationDetail() {
@@ -2081,6 +2113,25 @@ HTML_TEMPLATE = """
         await loadConversations();
         await loadSelectedConversation();
       }, 220);
+    });
+
+    document.addEventListener("keydown", async (event) => {
+      if (
+        !event.altKey ||
+        event.ctrlKey ||
+        event.metaKey ||
+        event.shiftKey ||
+        isTypingTarget(event.target)
+      ) {
+        return;
+      }
+      if (event.key === "ArrowUp") {
+        event.preventDefault();
+        await selectConversationByOffset(-1);
+      } else if (event.key === "ArrowDown") {
+        event.preventDefault();
+        await selectConversationByOffset(1);
+      }
     });
 
     async function boot() {
