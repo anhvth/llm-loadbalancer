@@ -18,6 +18,7 @@ dependencies = [
 cat_db = "cat_db:main"
 llm-proxy = "main:main"
 collect-jsonl = "llm_loadbalancer.tools.collect_jsonl:main"
+build-unique-sft = "llm_loadbalancer.tools.build_unique_conversation:main"
 annotate-full-conversations = "llm_loadbalancer.tools.annotate_full_conversations:main"
 
 [build-system]
@@ -40,6 +41,7 @@ only-include = [
     "src/llm_loadbalancer/__init__.py",
     "src/llm_loadbalancer/tools/__init__.py",
     "src/llm_loadbalancer/tools/collect_jsonl.py",
+    "src/llm_loadbalancer/tools/build_unique_conversation.py",
     "src/llm_loadbalancer/tools/annotate_full_conversations.py",
     "src/llm_loadbalancer/tools/convert_to_sft_data.py",
     "src/llm_loadbalancer/tools/convert_to_sft_data_anthropic.py",

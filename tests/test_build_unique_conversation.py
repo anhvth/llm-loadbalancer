@@ -1,107 +1,166 @@
-from llm_loadbalancer.tools import build_unique_conversation
+from llm_loadbalancer.tools.build_unique_conversation import (
+    deduplicate_by_rendered_prompt,
+    _convert_row,
+)
 
 
-def _row(
-    messages: list[dict],
-    output: dict | None = None,
-) -> build_unique_conversation._LoadedRow:
-    row = {"input": {"messages": messages}, "output": output}
-    return build_unique_conversation._LoadedRow(
-        row=row,
-        history_tokens=build_unique_conversation._history_tokens_for_row(row, "test"),
+def test_exact_duplicates_deduplicated():
+    prompt = "<|im_start|>user\nhi<|im_end|>\n<|im_start|>assistant\nhello<|im_end|>\n"
+    items = [
+        (
+            [
+                {"role": "user", "content": "hi"},
+                {"role": "assistant", "content": "hello"},
+            ],
+            prompt,
+        ),
+        (
+            [
+                {"role": "user", "content": "hi"},
+                {"role": "assistant", "content": "hello"},
+            ],
+            prompt,
+        ),
+    ]
+    kept = deduplicate_by_rendered_prompt(items)
+    assert len(kept) == 1
+
+
+def test_same_input_different_output_both_kept():
+    prompt_a = (
+        "<|im_start|>user\nhi<|im_end|>\n<|im_start|>assistant\nhello<|im_end|>\n"
     )
-
-
-def test_annotate_conversations_drops_prefix_rows():
-    shorter = _row(
-        [
-            {"role": "user", "content": "hi"},
-        ]
+    prompt_b = (
+        "<|im_start|>user\nhi<|im_end|>\n<|im_start|>assistant\nhey there<|im_end|>\n"
     )
-    longer = _row(
-        [
-            {"role": "user", "content": "hi"},
-            {"role": "assistant", "content": "hello"},
-            {"role": "user", "content": "continue"},
-        ]
+    items = [
+        (
+            [
+                {"role": "user", "content": "hi"},
+                {"role": "assistant", "content": "hello"},
+            ],
+            prompt_a,
+        ),
+        (
+            [
+                {"role": "user", "content": "hi"},
+                {"role": "assistant", "content": "hey there"},
+            ],
+            prompt_b,
+        ),
+    ]
+    kept = deduplicate_by_rendered_prompt(items)
+    assert len(kept) == 2
+
+
+def test_prefix_conversation_dropped():
+    short_prompt = (
+        "<|im_start|>user\nhi<|im_end|>\n<|im_start|>assistant\nhello<|im_end|>\n"
     )
-
-    annotated = build_unique_conversation._annotate_conversations([shorter, longer])
-
-    assert len(annotated) == 1
-    assert annotated[0]["input"]["messages"] == longer.row["input"]["messages"]
-    assert annotated[0]["key_conversation_id"] == 0
-    assert annotated[0]["key_is_longest"] is True
-
-
-def test_annotate_conversations_uses_completed_normalized_turns():
-    shorter = _row(
-        [
-            {
-                "role": "user",
-                "content": [{"type": "text", "text": "hi", "cache_control": {"type": "ephemeral"}}],
-            },
-        ],
-        {"content": [{"type": "text", "text": "hello"}]},
+    long_prompt = (
+        short_prompt
+        + "<|im_start|>user\ncontinue<|im_end|>\n<|im_start|>assistant\nsure<|im_end|>\n"
     )
-    longer = _row(
-        [
-            {"role": "user", "content": [{"type": "text", "text": "hi"}]},
-            {
-                "role": "assistant",
-                "content": [
-                    {"type": "thinking", "thinking": "greet", "signature": "abc"},
-                    {"type": "text", "text": "hello"},
-                ],
-            },
-            {"role": "user", "content": [{"type": "text", "text": "continue"}]},
-        ],
-        {"content": [{"type": "text", "text": "sure"}]},
-    )
-
-    annotated = build_unique_conversation._annotate_conversations([shorter, longer])
-
-    assert len(annotated) == 1
-    assert annotated[0]["input"]["messages"] == longer.row["input"]["messages"]
+    short_msgs = [
+        {"role": "user", "content": "hi"},
+        {"role": "assistant", "content": "hello"},
+    ]
+    long_msgs = short_msgs + [
+        {"role": "user", "content": "continue"},
+        {"role": "assistant", "content": "sure"},
+    ]
+    items = [
+        (short_msgs, short_prompt),
+        (long_msgs, long_prompt),
+    ]
+    kept = deduplicate_by_rendered_prompt(items)
+    assert len(kept) == 1
+    assert len(kept[0]) == 4
 
 
-def test_annotate_conversations_matches_streamed_partial_tool_use_to_history():
-    shorter = _row(
-        [
-            {"role": "user", "content": "touch hello"},
-        ],
-        {
-            "content": [
-                {"type": "text", "text": "\n\n\n"},
-                {
-                    "type": "tool_use",
-                    "id": "call_1",
-                    "name": "Bash",
-                    "partial_json": '{"command": "touch \\"hello\\""}',
-                },
+def test_independent_conversations_both_kept():
+    items = [
+        ([{"role": "user", "content": "hello"}], "prompt_A"),
+        ([{"role": "user", "content": "goodbye"}], "prompt_B"),
+    ]
+    kept = deduplicate_by_rendered_prompt(items)
+    assert len(kept) == 2
+
+
+def test_empty_input_returns_empty():
+    assert deduplicate_by_rendered_prompt([]) == []
+
+
+def test_convert_row_includes_openai_output_in_rendered_prompt():
+    """OpenAI-format outputs must appear in the rendered prompt."""
+
+    class _FakeTokenizer:
+        def apply_chat_template(
+            self, messages, tools=None, tokenize=False, add_generation_prompt=False
+        ):
+            return "".join(
+                f"<|im_start|>{m['role']}\n{m['content']}<|im_end|>\n" for m in messages
+            )
+
+    record = {
+        "input": {"messages": [{"role": "user", "content": "hi"}]},
+        "output": {
+            "choices": [
+                {"message": {"role": "assistant", "content": "hello from openai"}}
             ],
         },
-    )
-    longer = _row(
-        [
-            {"role": "user", "content": "touch hello"},
-            {
-                "role": "assistant",
-                "content": [
-                    {
-                        "type": "tool_use",
-                        "id": "call_1",
-                        "name": "Bash",
-                        "input": {"command": 'touch "hello"'},
-                    },
-                ],
-            },
-            {"role": "user", "content": "done"},
-        ],
-        {"content": [{"type": "text", "text": "ok"}]},
-    )
+    }
+    sft_messages, rendered = _convert_row(record, _FakeTokenizer())
+    assert "hello from openai" in rendered
+    assert sft_messages[-1]["content"] == "hello from openai"
 
-    annotated = build_unique_conversation._annotate_conversations([shorter, longer])
 
-    assert len(annotated) == 1
-    assert annotated[0]["input"]["messages"] == longer.row["input"]["messages"]
+def test_convert_row_includes_anthropic_output_in_rendered_prompt():
+    """Anthropic-format outputs must appear in the rendered prompt."""
+
+    class _FakeTokenizer:
+        def apply_chat_template(
+            self, messages, tools=None, tokenize=False, add_generation_prompt=False
+        ):
+            return "".join(
+                f"<|im_start|>{m['role']}\n{m['content']}<|im_end|>\n" for m in messages
+            )
+
+    record = {
+        "input": {"messages": [{"role": "user", "content": "hi"}]},
+        "output": {"content": [{"type": "text", "text": "hello from anthropic"}]},
+    }
+    sft_messages, rendered = _convert_row(record, _FakeTokenizer())
+    assert "hello from anthropic" in rendered
+    assert sft_messages[-1]["content"] == "hello from anthropic"
+
+
+def test_two_openai_calls_same_input_different_output_both_kept():
+    """The original bug: same input, different OpenAI outputs must produce 2 conversations."""
+
+    class _FakeTokenizer:
+        def apply_chat_template(
+            self, messages, tools=None, tokenize=False, add_generation_prompt=False
+        ):
+            return "".join(
+                f"<|im_start|>{m['role']}\n{m['content']}<|im_end|>\n" for m in messages
+            )
+
+    record_a = {
+        "input": {"messages": [{"role": "user", "content": "hi ban"}]},
+        "output": {
+            "choices": [{"message": {"role": "assistant", "content": "xin chào!"}}]
+        },
+    }
+    record_b = {
+        "input": {"messages": [{"role": "user", "content": "hi ban"}]},
+        "output": {
+            "choices": [{"message": {"role": "assistant", "content": "chào bạn!"}}]
+        },
+    }
+    tok = _FakeTokenizer()
+    msgs_a, prompt_a = _convert_row(record_a, tok)
+    msgs_b, prompt_b = _convert_row(record_b, tok)
+
+    kept = deduplicate_by_rendered_prompt([(msgs_a, prompt_a), (msgs_b, prompt_b)])
+    assert len(kept) == 2
