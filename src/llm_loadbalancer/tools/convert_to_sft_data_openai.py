@@ -3,6 +3,8 @@ import json
 from pathlib import Path
 from typing import Any
 
+from llm_loadbalancer.tools.sft_settings import preserve_thinking_in_content
+
 
 def _text_from_content(content: Any) -> str:
     if content is None:
@@ -42,16 +44,56 @@ def _with_thinking(content: Any, reasoning: Any) -> str:
     return f"<think>\n{reasoning.strip()}\n</think>\n\n{text}"
 
 
-def _normalize_input_message(message: dict[str, Any]) -> dict[str, str]:
+def _inline_historical_reasoning_for_qwen(messages: list[dict[str, Any]]) -> None:
+    """Inline assistant reasoning into content for turns at/before last user."""
+    last_user_index = None
+    for index, message in enumerate(messages):
+        if message.get("role") == "user":
+            last_user_index = index
+
+    if last_user_index is None:
+        return
+
+    for index, message in enumerate(messages):
+        if index > last_user_index or message.get("role") != "assistant":
+            continue
+
+        reasoning = message.get("reasoning_content")
+        if not isinstance(reasoning, str) or not reasoning.strip():
+            continue
+
+        think_block = f"<think>\n{reasoning.strip()}\n</think>\n\n"
+        content = message.get("content", "")
+        if isinstance(content, str):
+            if content.lstrip().startswith("<think>"):
+                continue
+            message["content"] = think_block + content.lstrip("\n")
+
+
+def _assistant_reasoning(message: dict[str, Any]) -> str | None:
+    reasoning = message.get("reasoning") or message.get("reasoning_content")
+    if not isinstance(reasoning, str):
+        return None
+    stripped = reasoning.strip()
+    if not stripped:
+        return None
+    return stripped
+
+
+def _normalize_input_message(message: dict[str, Any]) -> dict[str, Any]:
     role = str(message.get("role", "user"))
     if role == "assistant":
-        return {
+        reasoning = _assistant_reasoning(message)
+        content = _text_from_content(message.get("content")).lstrip("\n")
+        out: dict[str, Any] = {
             "role": role,
-            "content": _with_thinking(
-                message.get("content"),
-                message.get("reasoning") or message.get("reasoning_content"),
-            ),
+            "content": content,
         }
+        if preserve_thinking_in_content() and reasoning is not None:
+            # Keep explicit reasoning_content so Qwen template won't strip
+            # historical <think> blocks from content during rendering.
+            out["reasoning_content"] = reasoning
+        return out
 
     return {
         "role": role,
@@ -59,7 +101,7 @@ def _normalize_input_message(message: dict[str, Any]) -> dict[str, str]:
     }
 
 
-def _extract_assistant_output(output: Any) -> dict[str, str] | None:
+def _extract_assistant_output(output: Any) -> dict[str, Any] | None:
     if not isinstance(output, dict):
         return None
 
@@ -75,13 +117,15 @@ def _extract_assistant_output(output: Any) -> dict[str, str] | None:
     if not isinstance(message, dict):
         return None
 
-    return {
+    reasoning = _assistant_reasoning(message)
+    content = _text_from_content(message.get("content")).lstrip("\n")
+    out: dict[str, Any] = {
         "role": "assistant",
-        "content": _with_thinking(
-            message.get("content"),
-            message.get("reasoning") or message.get("reasoning_content"),
-        ),
+        "content": content,
     }
+    if preserve_thinking_in_content() and reasoning is not None:
+        out["reasoning_content"] = reasoning
+    return out
 
 
 def convert_openai_chat_record(record: dict[str, Any], include_output: bool = True):
@@ -100,6 +144,9 @@ def convert_openai_chat_record(record: dict[str, Any], include_output: bool = Tr
         assistant_output = _extract_assistant_output(record.get("output"))
         if assistant_output is not None:
             out["messages"].append(assistant_output)
+
+    if preserve_thinking_in_content():
+        _inline_historical_reasoning_for_qwen(out["messages"])
 
     return out
 

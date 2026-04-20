@@ -28,6 +28,7 @@ from llm_loadbalancer.tools.convert_to_sft_data import (
     split_rendered_chat,
     tools_for_chat_template,
 )
+from llm_loadbalancer.tools.sft_settings import drop_prefix_snapshots_in_unique
 
 
 def _render_prompt_string(
@@ -99,6 +100,37 @@ def _select_best_record(records: list[dict[str, Any]]) -> dict[str, Any]:
     return max(records, key=_score)
 
 
+def _render_row_prompt(record: dict[str, Any], tokenizer: Any) -> str:
+    converted = convert_record(record)
+    tools = _record_tools(record)
+    return _render_prompt_string(converted["messages"], tokenizer, tools=tools)
+
+
+def _drop_prefix_prompts(prompts: list[str]) -> list[str]:
+    """Drop prompts that are strict prefixes of longer prompts."""
+    if not prompts:
+        return []
+
+    # Exact dedupe first while preserving first-seen item.
+    unique_prompts: list[str] = []
+    seen: set[str] = set()
+    for prompt in prompts:
+        if prompt in seen:
+            continue
+        seen.add(prompt)
+        unique_prompts.append(prompt)
+
+    # Longer prompts first so strict-prefix checks only look backward.
+    unique_prompts.sort(key=len, reverse=True)
+
+    kept: list[str] = []
+    for prompt in unique_prompts:
+        if any(len(prompt) < len(existing) and existing.startswith(prompt) for existing in kept):
+            continue
+        kept.append(prompt)
+    return kept
+
+
 def group_by_session_then_dedupe(
     records: list[dict[str, Any]],
     tokenizer: Any,
@@ -126,9 +158,14 @@ def group_by_session_then_dedupe(
         sft_messages, rendered = _convert_row(best, tokenizer)
         items.append((sft_messages, rendered))
 
-    # Convert no-session records
+    # Convert no-session records: record -> rendered prompt -> prefix drop -> role/content
+    no_session_prompts: list[str] = []
     for record in tqdm(no_session, desc="No-session records"):
-        sft_messages, rendered = _convert_row(record, tokenizer)
+        no_session_prompts.append(_render_row_prompt(record, tokenizer))
+    if drop_prefix_snapshots_in_unique():
+        no_session_prompts = _drop_prefix_prompts(no_session_prompts)
+    for rendered in no_session_prompts:
+        sft_messages = split_rendered_chat(rendered, tokenizer)
         items.append((sft_messages, rendered))
 
     return deduplicate_by_rendered_prompt(items)

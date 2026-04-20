@@ -3,6 +3,8 @@ import json
 from copy import deepcopy
 from pathlib import Path
 
+from llm_loadbalancer.tools.sft_settings import preserve_thinking_in_content
+
 _BILLING_HEADER_PREFIX = "x-anthropic-billing-header:"
 
 
@@ -351,7 +353,8 @@ def convert_claude_code_record(record, include_output=False):
                 {"role": "assistant", "content": output_obj.get("content", "")}
             )
 
-    _inline_historical_reasoning_for_qwen(out["messages"])
+    if preserve_thinking_in_content():
+        _inline_historical_reasoning_for_qwen(out["messages"])
 
     return out
 

@@ -1,6 +1,7 @@
 from llm_loadbalancer.tools.build_unique_conversation import (
     deduplicate_by_rendered_prompt,
     _convert_row,
+    group_by_session_then_dedupe,
 )
 
 
@@ -197,4 +198,195 @@ def test_two_openai_calls_same_input_different_output_both_kept():
     msgs_b, prompt_b = _convert_row(record_b, tok)
 
     kept = deduplicate_by_rendered_prompt([(msgs_a, prompt_a), (msgs_b, prompt_b)])
+    assert len(kept) == 2
+
+
+def test_openai_prefix_snapshots_dropped_without_session_id():
+    """No-session OpenAI snapshots with strict message-prefix should collapse."""
+
+    class _FakeTokenizer:
+        def apply_chat_template(
+            self, messages, tools=None, tokenize=False, add_generation_prompt=False
+        ):
+            rendered = []
+            last_user_index = None
+            for index, message in enumerate(messages):
+                if message.get("role") == "user":
+                    last_user_index = index
+            for index, message in enumerate(messages):
+                content = message["content"]
+                reasoning = message.get("reasoning_content")
+                if (
+                    message.get("role") == "assistant"
+                    and isinstance(reasoning, str)
+                    and reasoning
+                    and not str(content).lstrip().startswith("<think>")
+                    and last_user_index is not None
+                    and index > last_user_index
+                ):
+                    content = f"<think>\n{reasoning}\n</think>\n\n{content}"
+                rendered.append(
+                    f"<|im_start|>{message['role']}\n{content}<|im_end|>\n"
+                )
+            return "".join(rendered)
+
+    short = {
+        "input": {
+            "messages": [
+                {"role": "system", "content": "sys"},
+                {"role": "user", "content": [{"type": "text", "text": "hi"}]},
+            ],
+        },
+        "output": {
+            "choices": [
+                {
+                    "message": {
+                        "role": "assistant",
+                        "content": "hello",
+                        "reasoning": "greet",
+                    }
+                }
+            ]
+        },
+    }
+    long = {
+        "input": {
+            "messages": [
+                {"role": "system", "content": "sys"},
+                {"role": "user", "content": [{"type": "text", "text": "hi"}]},
+                {
+                    "role": "assistant",
+                    "content": "hello",
+                    "reasoning": "greet",
+                },
+                {"role": "user", "content": [{"type": "text", "text": "how are you"}]},
+            ],
+        },
+        "output": {
+            "choices": [
+                {
+                    "message": {
+                        "role": "assistant",
+                        "content": "great",
+                        "reasoning": "small talk",
+                    }
+                }
+            ]
+        },
+    }
+
+    kept = group_by_session_then_dedupe([short, long], _FakeTokenizer())
+    assert len(kept) == 1
+
+
+def test_openai_same_length_variants_not_dropped_by_prefix_pruning():
+    """Same-length histories are alternatives, not strict-prefix snapshots."""
+
+    class _FakeTokenizer:
+        def apply_chat_template(
+            self, messages, tools=None, tokenize=False, add_generation_prompt=False
+        ):
+            payload = f"messages={len(messages)} last={messages[-1]['content']}"
+            return f"<|im_start|>assistant\n{payload}<|im_end|>\n"
+
+    a = {
+        "input": {
+            "messages": [
+                {"role": "user", "content": [{"type": "text", "text": "hi"}]},
+            ],
+        },
+        "output": {"choices": [{"message": {"role": "assistant", "content": "hello"}}]},
+    }
+    b = {
+        "input": {
+            "messages": [
+                {"role": "user", "content": [{"type": "text", "text": "hi"}]},
+            ],
+        },
+        "output": {"choices": [{"message": {"role": "assistant", "content": "hey"}}]},
+    }
+
+    kept = group_by_session_then_dedupe([a, b], _FakeTokenizer())
+    assert len(kept) == 2
+
+
+def test_openai_new_conversation_same_hi_keeps_two_conversations():
+    """A new conversation that starts with same 'hi' should not be collapsed."""
+
+    class _FakeTokenizer:
+        def apply_chat_template(
+            self, messages, tools=None, tokenize=False, add_generation_prompt=False
+        ):
+            rendered = []
+            for message in messages:
+                rendered.append(
+                    f"<|im_start|>{message['role']}\n{message['content']}<|im_end|>\n"
+                )
+            return "".join(rendered)
+
+    row0 = {
+        "input": {
+            "messages": [
+                {"role": "system", "content": "sys"},
+                {"role": "user", "content": [{"type": "text", "text": "hi"}]},
+            ]
+        },
+        "output": {
+            "choices": [
+                {
+                    "message": {
+                        "role": "assistant",
+                        "content": "Hi! How can I help you today?",
+                        "reasoning": "friendly greet v1",
+                    }
+                }
+            ]
+        },
+    }
+    row1 = {
+        "input": {
+            "messages": [
+                {"role": "system", "content": "sys"},
+                {"role": "user", "content": [{"type": "text", "text": "hi"}]},
+                {
+                    "role": "assistant",
+                    "content": "Hi! How can I help you today?",
+                    "reasoning": "friendly greet v1",
+                },
+                {"role": "user", "content": [{"type": "text", "text": "how are you"}]},
+            ]
+        },
+        "output": {
+            "choices": [
+                {
+                    "message": {
+                        "role": "assistant",
+                        "content": "I'm doing well.",
+                        "reasoning": "small talk answer",
+                    }
+                }
+            ]
+        },
+    }
+    row2 = {
+        "input": {
+            "messages": [
+                {"role": "system", "content": "sys"},
+                {"role": "user", "content": [{"type": "text", "text": "hi"}]},
+            ]
+        },
+        "output": {
+            "choices": [
+                {
+                    "message": {
+                        "role": "assistant",
+                        "content": "Hi! How can I help you today?",
+                        "reasoning": "friendly greet v2",
+                    }
+                }
+            ]
+        },
+    }
+
+    kept = group_by_session_then_dedupe([row0, row1, row2], _FakeTokenizer())
     assert len(kept) == 2

@@ -86,7 +86,8 @@ def test_convert_openai_chat_completion_embeds_reasoning_in_content():
         {"role": "user", "content": "hi openai"},
         {
             "role": "assistant",
-            "content": "<think>\ngreet the user\n</think>\n\nHello! How can I help?",
+            "content": "Hello! How can I help?",
+            "reasoning_content": "greet the user",
         },
     ]
 
@@ -114,6 +115,29 @@ def test_convert_openai_chat_completion_flattens_text_parts_like_vllm():
     )
 
     assert converted["messages"][0] == {"role": "user", "content": "hello\nworld"}
+
+
+def test_convert_openai_historical_assistant_keeps_reasoning_content():
+    converted = convert_to_sft_data_openai.convert_openai_chat_record(
+        {
+            "input": {
+                "messages": [
+                    {"role": "user", "content": "hi"},
+                    {
+                        "role": "assistant",
+                        "content": "hello",
+                        "reasoning": "greet",
+                    },
+                    {"role": "user", "content": "next"},
+                ],
+            },
+            "output": {"choices": [{"message": {"role": "assistant", "content": "done"}}]},
+        }
+    )
+
+    historical = converted["messages"][1]
+    assert historical["content"] == "<think>\ngreet\n</think>\n\nhello"
+    assert historical["reasoning_content"] == "greet"
 
 
 def test_dispatcher_routes_openai_rows(tmp_path: Path, monkeypatch):
@@ -147,10 +171,7 @@ def test_dispatcher_routes_openai_rows(tmp_path: Path, monkeypatch):
 
     row = json.loads(output_path.read_text(encoding="utf-8"))
     assert list(row) == ["messages"]
-    assert row["messages"][-1] == {
-        "role": "assistant",
-        "content": "<think>\nsay hello\n</think>\n\nhello",
-    }
+    assert row["messages"][-1] == {"role": "assistant", "content": "hello"}
     assert "input" not in row
     assert "output" not in row
     assert "tools" not in row
