@@ -24,7 +24,9 @@ from llm_loadbalancer.tools.convert_to_sft_data import (
     _load_tokenizer,
     _record_tools,
     convert_record,
+    messages_for_chat_template,
     split_rendered_chat,
+    tools_for_chat_template,
 )
 
 
@@ -34,8 +36,8 @@ def _render_prompt_string(
     tools: list[dict[str, Any]] | None = None,
 ) -> str:
     rendered = tokenizer.apply_chat_template(
-        messages,
-        tools=tools,
+        messages_for_chat_template(messages, tokenizer),
+        tools=tools_for_chat_template(tools, tokenizer),
         tokenize=False,
         add_generation_prompt=False,
     )
@@ -51,7 +53,7 @@ def _convert_row(
     converted = convert_record(record)
     tools = _record_tools(record)
     rendered = _render_prompt_string(converted["messages"], tokenizer, tools=tools)
-    sft_messages = split_rendered_chat(rendered)
+    sft_messages = split_rendered_chat(rendered, tokenizer)
     return sft_messages, rendered
 
 
@@ -172,7 +174,7 @@ def deduplicate_by_rendered_prompt(
 def build_unique_sft(
     input_path: Path,
     output_path: Path,
-    tokenizer_name: str = DEFAULT_TOKENIZER,
+    tokenizer_name: str | None = None,
 ) -> tuple[int, int]:
     """Read raw logs, convert to SFT, deduplicate, write output."""
     tokenizer = _load_tokenizer(tokenizer_name)
@@ -215,8 +217,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--tokenizer",
-        default=DEFAULT_TOKENIZER,
-        help=f"Tokenizer for chat template rendering (default: {DEFAULT_TOKENIZER})",
+        default=None,
+        help=(
+            "Tokenizer for chat template rendering "
+            f"(default: TOKENIZER_PATH or {DEFAULT_TOKENIZER})"
+        ),
     )
     return parser
 
