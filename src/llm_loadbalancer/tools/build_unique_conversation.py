@@ -32,6 +32,46 @@ from llm_loadbalancer.tools.convert_to_sft_data import (
 )
 from llm_loadbalancer.tools.sft_settings import drop_prefix_snapshots_in_unique
 
+_TITLE_PROMPT_MARKER = "Generate a concise, sentence-case title (3-7 words)"
+
+
+def _is_title_generation_request(record: dict[str, Any]) -> bool:
+    source = record.get("input")
+    if not isinstance(source, dict):
+        source = record
+
+    system = source.get("system")
+    if isinstance(system, str):
+        return _TITLE_PROMPT_MARKER in system
+
+    if not isinstance(system, list):
+        return False
+
+    for block in system:
+        if isinstance(block, str) and _TITLE_PROMPT_MARKER in block:
+            return True
+        if isinstance(block, dict):
+            text = block.get("text")
+            if isinstance(text, str) and _TITLE_PROMPT_MARKER in text:
+                return True
+    return False
+
+
+def _is_count_tokens_request(record: dict[str, Any]) -> bool:
+    output = record.get("output")
+    if not isinstance(output, dict):
+        return False
+    if "content" in output or "choices" in output:
+        return False
+    return "input_tokens" in output
+
+
+def _should_skip_for_sft(record: dict[str, Any]) -> bool:
+    # Keep skip heuristics centralized here. If we need to exclude additional
+    # non-conversation row types in the future, add a helper predicate above
+    # and extend this return condition.
+    return _is_title_generation_request(record) or _is_count_tokens_request(record)
+
 
 def _render_prompt_string(
     messages: list[dict[str, Any]],
@@ -129,6 +169,8 @@ def group_by_session_then_dedupe(
     """Convert every row to prompt first, drop prefix snapshots, then dedupe."""
     prompt_entries: list[tuple[str, str]] = []
     for record in tqdm(records, desc="Rows to prompts"):
+        if _should_skip_for_sft(record):
+            continue
         prompt_entries.append(
             (_render_row_prompt(record, tokenizer), str(record.get("timestamp", "") or ""))
         )

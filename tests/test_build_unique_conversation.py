@@ -420,3 +420,130 @@ def test_group_by_session_then_dedupe_returns_oldest_first_by_timestamp():
     kept = cast(list[list[dict[str, str]]], group_by_session_then_dedupe([new, old], _FakeTokenizer()))
     assert kept[0][0]["content"] == "old"
     assert kept[1][0]["content"] == "new"
+
+
+def test_anthropic_whitespace_before_tool_result_does_not_split_conversation():
+    """Whitespace-only text blocks around tool results should not create extra conversations."""
+
+    class _FakeTokenizer:
+        def apply_chat_template(
+            self, messages, tools=None, tokenize=False, add_generation_prompt=False
+        ):
+            rendered = []
+            for message in messages:
+                rendered.append(
+                    f"<|im_start|>{message['role']}\n{message['content']}<|im_end|>\n"
+                )
+            return "".join(rendered)
+
+    short = {
+        "timestamp": "2026-04-20T08:02:35+00:00",
+        "input": {
+            "messages": [
+                {"role": "user", "content": "explain the code base"},
+                {
+                    "role": "assistant",
+                    "content": [
+                        {
+                            "type": "tool_use",
+                            "id": "call_1",
+                            "name": "Glob",
+                            "input": {"pattern": "src/**/*.py"},
+                        }
+                    ],
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "call_1",
+                            "content": "src/llm_loadbalancer/tools/build_unique_conversation.py",
+                        }
+                    ],
+                },
+            ]
+        },
+        "output": {"content": [{"type": "text", "text": "found the files"}]},
+    }
+    long = {
+        "timestamp": "2026-04-20T08:02:43+00:00",
+        "input": {
+            "messages": [
+                {"role": "user", "content": "explain the code base"},
+                {
+                    "role": "assistant",
+                    "content": [
+                        {
+                            "type": "tool_use",
+                            "id": "call_1",
+                            "name": "Glob",
+                            "input": {"pattern": "src/**/*.py"},
+                        }
+                    ],
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "   \n  "},
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "call_1",
+                            "content": "src/llm_loadbalancer/tools/build_unique_conversation.py",
+                        },
+                    ],
+                },
+                {"role": "assistant", "content": [{"type": "text", "text": "found the files"}]},
+                {"role": "user", "content": "summarize it"},
+            ]
+        },
+        "output": {"content": [{"type": "text", "text": "summary"}]},
+    }
+
+    kept = group_by_session_then_dedupe([short, long], _FakeTokenizer())
+    assert len(kept) == 1
+
+
+def test_group_by_session_then_dedupe_skips_title_and_count_tokens_rows():
+    class _FakeTokenizer:
+        def apply_chat_template(
+            self, messages, tools=None, tokenize=False, add_generation_prompt=False
+        ):
+            rendered = []
+            for message in messages:
+                rendered.append(
+                    f"<|im_start|>{message['role']}\n{message['content']}<|im_end|>\n"
+                )
+            return "".join(rendered)
+
+    title_row = {
+        "timestamp": "2026-04-20T08:02:31+00:00",
+        "input": {
+            "system": [
+                {"type": "text", "text": "You are a Claude agent, built on Anthropic's Claude Agent SDK."},
+                {
+                    "type": "text",
+                    "text": (
+                        "Generate a concise, sentence-case title (3-7 words) "
+                        "that captures the main topic or goal of this coding session."
+                    ),
+                },
+            ],
+            "messages": [{"role": "user", "content": "explain the code base"}],
+        },
+        "output": {"content": [{"type": "text", "text": "{\"title\":\"Explain code\"}"}]},
+    }
+    count_tokens_row = {
+        "timestamp": "2026-04-20T08:02:36+00:00",
+        "input": {"messages": [{"role": "user", "content": "some long file text"}]},
+        "output": {"input_tokens": 1234, "context_management": {"original_input_tokens": 1234}},
+    }
+    real_row = {
+        "timestamp": "2026-04-20T08:02:43+00:00",
+        "input": {"messages": [{"role": "user", "content": "explain the code base"}]},
+        "output": {"content": [{"type": "text", "text": "Sure, here's the overview."}]},
+    }
+
+    kept = group_by_session_then_dedupe([title_row, count_tokens_row, real_row], _FakeTokenizer())
+    assert len(kept) == 1
+    assert kept[0][0] == {"role": "user", "content": "explain the code base"}

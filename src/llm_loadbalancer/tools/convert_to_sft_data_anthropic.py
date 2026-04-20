@@ -205,11 +205,28 @@ def convert_claude_code_record(record, include_output=False):
 
         pending_user_blocks = []
 
+        def is_whitespace_only_text_content(rendered_content):
+            if isinstance(rendered_content, str):
+                return not rendered_content.strip()
+            if not isinstance(rendered_content, list):
+                return False
+
+            saw_text = False
+            for item in rendered_content:
+                if not isinstance(item, dict) or item.get("type") != "text":
+                    return False
+                text = item.get("text")
+                if not isinstance(text, str) or text.strip():
+                    return False
+                saw_text = True
+            return saw_text
+
         def flush_user():
             nonlocal pending_user_blocks
             if pending_user_blocks:
                 rendered = normalize_renderable_content(pending_user_blocks)
-                out["messages"].append({"role": "user", "content": rendered})
+                if not is_whitespace_only_text_content(rendered):
+                    out["messages"].append({"role": "user", "content": rendered})
                 pending_user_blocks = []
 
         for block in content:
