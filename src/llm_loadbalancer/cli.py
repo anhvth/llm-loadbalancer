@@ -113,6 +113,8 @@ def start_everything(
     config_path: pathlib.Path,
     verbose: bool = False,
     routing: str | None = None,
+    no_cache: bool = False,
+    reload: bool = False,
 ) -> int:
     ensure_config_exists(config_path)
     cfg = parse_config(config_path)
@@ -134,9 +136,15 @@ def start_everything(
         logger.error("{}", exc)
         return 1
     if routing is None:
-        serve_forever(config_path, verbose=verbose)
+        serve_forever(config_path, verbose=verbose, no_cache=no_cache, reload=reload)
     else:
-        serve_forever(config_path, verbose=verbose, routing=routing)
+        serve_forever(
+            config_path,
+            verbose=verbose,
+            routing=routing,
+            no_cache=no_cache,
+            reload=reload,
+        )
     return 0
 
 
@@ -158,12 +166,22 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--silent",
         action="store_true",
-        help="Suppress printing JSON request/response files to the local cache directory",
+        help="Disable verbose request logging to the terminal",
+    )
+    parser.add_argument(
+        "--no-cache",
+        action="store_true",
+        help="Disable filesystem-backed cache data like request logs, health state, and affinity DB",
     )
     parser.add_argument(
         "--routing",
         choices=("random", "smart"),
         help="Routing mode. random disables message affinity; smart keeps affinity.",
+    )
+    parser.add_argument(
+        "--reload",
+        action="store_true",
+        help="Auto-restart when source files change",
     )
     return parser
 
@@ -177,8 +195,19 @@ def main(argv: list[str] | None = None) -> int:
 
     try:
         if args.routing is None:
-            return start_everything(args.config, verbose=not args.silent)
-        return start_everything(args.config, verbose=not args.silent, routing=args.routing)
+            return start_everything(
+                args.config,
+                verbose=not args.silent,
+                no_cache=args.no_cache,
+                reload=args.reload,
+            )
+        return start_everything(
+            args.config,
+            verbose=not args.silent,
+            routing=args.routing,
+            no_cache=args.no_cache,
+            reload=args.reload,
+        )
     except KeyboardInterrupt:
         return 130
 

@@ -142,6 +142,7 @@ def run_stub_server(port: int):
     server = ReusableThreadingHTTPServer(("127.0.0.1", port), StubHandler)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
+    wait_for_port(port)
     try:
         yield
     finally:
@@ -151,8 +152,8 @@ def run_stub_server(port: int):
 
 
 @contextmanager
-def run_load_balancer(config_path: Path, verbose: bool = False):
-    app = create_app(config_path, verbose=verbose)
+def run_load_balancer(config_path: Path, verbose: bool = False, no_cache: bool = False):
+    app = create_app(config_path, verbose=verbose, no_cache=no_cache)
     config = uvicorn.Config(app, host="127.0.0.1", port=0, log_level="warning")
     server = uvicorn.Server(config)
     sock = socket.socket()
@@ -426,8 +427,9 @@ def test_refresh_health_keeps_working_endpoints_and_warns_on_dead_ones(
         # Worker endpoints appear in ENDPOINTS column (unsorted within group)
         assert f"worker-1:8000 (local {upstream_ports[0]})" in rendered
         assert f"worker-2:8000 (local {upstream_ports[1]})" in rendered
-        # One worker down, one up: shows 1/2
-        assert "1/2" in rendered
+        # One worker stays healthy and one is reported down.
+        assert "1/1" in rendered
+        assert "unknown" in rendered
         # One error (Connection refused)
         assert "1" in rendered
         assert [endpoint.port for endpoint in app.valid_endpoints] == [upstream_ports[0]]
@@ -595,6 +597,147 @@ def test_check_endpoint_async_retries_transient_connection_errors(monkeypatch):
     assert calls == 2
 
 
+def test_handle_http_refreshes_health_after_transport_error(monkeypatch, tmp_path: Path):
+    config_path = tmp_path / "config.yaml"
+    upstream_ports = find_free_port_block(2)
+    write_config(config_path, upstream_ports, 8001)
+
+    monkeypatch.setattr(
+        load_balancer.LoadBalancerApp,
+        "_initial_healthcheck",
+        lambda self: [
+            load_balancer.EndpointCheckResult(host=host, port=port)
+            for host, port in self.upstream_endpoints
+        ],
+    )
+    monkeypatch.setattr(load_balancer.random, "choice", lambda values: min(values))
+
+    class FailingAsyncClient:
+        def build_request(self, method, url, headers=None, content=None):
+            return httpx.Request(method, url, headers=headers, content=content)
+
+        async def send(self, request, stream=True):
+            raise httpx.ConnectError("All connection attempts failed", request=request)
+
+    app = create_app(config_path)
+    app.client = FailingAsyncClient()
+
+    refresh_calls = 0
+
+    async def fake_refresh_health():
+        nonlocal refresh_calls
+        refresh_calls += 1
+        app.valid_endpoints = [load_balancer.EndpointCheckResult(host="worker-2", port=upstream_ports[1])]
+
+    monkeypatch.setattr(app, "refresh_health", fake_refresh_health)
+
+    messages = iter(
+        [
+            {
+                "type": "http.request",
+                "body": json.dumps({"model": "demo", "messages": [{"role": "user", "content": "hi"}]}).encode("utf-8"),
+                "more_body": False,
+            }
+        ]
+    )
+    sent: list[dict[str, object]] = []
+    scope = {
+        "type": "http",
+        "method": "POST",
+        "path": "/v1/chat/completions",
+        "raw_path": b"/v1/chat/completions",
+        "query_string": b"",
+        "headers": [(b"content-type", b"application/json")],
+    }
+
+    async def receive():
+        return next(messages)
+
+    async def send(message):
+        sent.append(message)
+
+    asyncio.run(app._handle_http(scope, receive, send))
+
+    assert refresh_calls == 1
+    assert [endpoint.port for endpoint in app.valid_endpoints] == [upstream_ports[1]]
+    assert sent[0]["type"] == "http.response.start"
+    assert sent[0]["status"] == 502
+    assert sent[1]["type"] == "http.response.body"
+    assert b"Upstream request failed: All connection attempts failed" in sent[1]["body"]
+
+
+def test_handle_http_does_not_refresh_health_for_upstream_5xx(monkeypatch, tmp_path: Path):
+    config_path = tmp_path / "config.yaml"
+    upstream_ports = find_free_port_block(1)
+    write_config(config_path, upstream_ports, 8001)
+
+    monkeypatch.setattr(
+        load_balancer.LoadBalancerApp,
+        "_initial_healthcheck",
+        lambda self: [
+            load_balancer.EndpointCheckResult(host=host, port=port)
+            for host, port in self.upstream_endpoints
+        ],
+    )
+
+    class FakeResponse:
+        def __init__(self):
+            self.status_code = 503
+            self.headers = {"content-type": "application/json"}
+
+        async def aiter_raw(self):
+            yield b'{"error":"backend overloaded"}'
+
+        async def aclose(self):
+            return None
+
+    class SuccessfulAsyncClient:
+        def build_request(self, method, url, headers=None, content=None):
+            return httpx.Request(method, url, headers=headers, content=content)
+
+        async def send(self, request, stream=True):
+            return FakeResponse()
+
+    app = create_app(config_path)
+    app.client = SuccessfulAsyncClient()
+
+    refresh_calls = 0
+
+    async def fake_refresh_health():
+        nonlocal refresh_calls
+        refresh_calls += 1
+
+    monkeypatch.setattr(app, "refresh_health", fake_refresh_health)
+    monkeypatch.setattr(app, "_log_exchange", lambda *args, **kwargs: None)
+
+    messages = iter([{"type": "http.request", "body": b"", "more_body": False}])
+    sent: list[dict[str, object]] = []
+    scope = {
+        "type": "http",
+        "method": "GET",
+        "path": "/models",
+        "raw_path": b"/models",
+        "query_string": b"",
+        "headers": [],
+    }
+
+    async def receive():
+        return next(messages)
+
+    async def send(message):
+        sent.append(message)
+
+    asyncio.run(app._handle_http(scope, receive, send))
+
+    assert refresh_calls == 0
+    assert sent[0]["type"] == "http.response.start"
+    assert sent[0]["status"] == 503
+    assert sent[1]["type"] == "http.response.body"
+    assert sent[1]["body"] == b'{"error":"backend overloaded"}'
+    assert sent[1]["more_body"] is True
+    assert sent[2] == {"type": "http.response.body", "body": b"", "more_body": False}
+
+
 def test_proxies_large_post_payload(tmp_path: Path):
     config_path = tmp_path / "config.yaml"
     upstream_ports = find_free_port_block(2)
@@ -668,6 +811,34 @@ def test_logs_bodyless_json_response_to_sqlite(tmp_path: Path):
     assert response.status == 200
     assert response_payload
     assert read_log_rows(db_path) == []
+
+
+def test_no_cache_does_not_write_request_logs_or_health_state(tmp_path: Path):
+    config_path = tmp_path / "config.yaml"
+    db_path = tmp_path / "request_logs"
+    upstream_ports = find_free_port_block(1)
+    write_config(config_path, upstream_ports, 8001)
+    config_path.write_text(config_path.read_text() + f"  log-dir: {db_path}\n")
+    request_payload = {"model": "demo", "messages": [{"role": "user", "content": "hi"}]}
+
+    with run_stub_server(upstream_ports[0]), run_load_balancer(
+        config_path,
+        no_cache=True,
+    ) as listen_port:
+        conn = http.client.HTTPConnection("127.0.0.1", listen_port, timeout=30)
+        conn.request(
+            "POST",
+            "/v1/chat/completions",
+            body=json.dumps(request_payload),
+            headers={"Content-Type": "application/json"},
+        )
+        response = conn.getresponse()
+        response.read()
+        conn.close()
+
+    assert response.status == 200
+    assert not (db_path / "requests").exists()
+    assert not (db_path / load_balancer.HEALTHCHECK_STATE_FILENAME).exists()
 
 
 def test_logs_assign_incrementing_ids(tmp_path: Path):
@@ -985,6 +1156,43 @@ def test_shares_messages_affinity_across_load_balancer_workers_via_sqlite(
     app_a._remember_messages_affinity(first_payload, upstream_ports[0])
 
     assert app_b._find_messages_affinity_port(second_payload) == upstream_ports[0]
+
+
+def test_no_cache_keeps_message_affinity_in_memory_only(tmp_path: Path, monkeypatch):
+    config_path = tmp_path / "config.yaml"
+    affinity_db_path = tmp_path / "affinity.sqlite3"
+    upstream_ports = find_free_port_block(2)
+    write_config(config_path, upstream_ports, 8001)
+    config_path.write_text(config_path.read_text() + f"  affinity-db: {affinity_db_path}\n")
+
+    first_payload = json.dumps(
+        {"model": "demo", "messages": [{"role": "user", "content": "hi"}]}
+    ).encode("utf-8")
+    second_payload = json.dumps(
+        {
+            "model": "demo",
+            "messages": [
+                {"role": "user", "content": "hi"},
+                {"role": "assistant", "content": "hello"},
+                {"role": "user", "content": "tell me more"},
+            ],
+        }
+    ).encode("utf-8")
+
+    monkeypatch.setattr(
+        load_balancer.LoadBalancerApp,
+        "_initial_healthcheck",
+        lambda self: [
+            load_balancer.EndpointCheckResult(host=host, port=port)
+            for host, port in self.upstream_endpoints
+        ],
+    )
+    app = create_app(config_path, no_cache=True)
+    app._remember_messages_affinity(first_payload, upstream_ports[0])
+
+    assert isinstance(app.message_affinity, load_balancer.InMemoryMessageAffinityStore)
+    assert app._find_messages_affinity_port(second_payload) == upstream_ports[0]
+    assert not affinity_db_path.exists()
 
 
 def test_reuses_messages_affinity_when_message_shape_changes(
@@ -1351,6 +1559,33 @@ def test_serve_forever_does_not_enable_reload(monkeypatch, tmp_path: Path):
     assert os.environ[load_balancer.LLM_PROXY_EFFECTIVE_WORKER_CONCURRENCY_ENV] == "123"
 
 
+def test_serve_forever_sets_no_cache_env(monkeypatch, tmp_path: Path):
+    config_path = tmp_path / "config.yaml"
+    upstream_ports = find_free_port_block(1)
+    write_config(config_path, upstream_ports, 8123)
+    seen = {}
+
+    def fake_run(*args, **kwargs):
+        seen["no_cache"] = os.environ[load_balancer.LLM_PROXY_NO_CACHE_ENV]
+
+    monkeypatch.setattr(load_balancer.uvicorn, "run", fake_run)
+    monkeypatch.setattr(
+        load_balancer,
+        "plan_file_descriptor_limits",
+        lambda cfg: load_balancer.FileDescriptorPlan(
+            configured_worker_concurrency=512,
+            effective_worker_concurrency=123,
+            required_soft_limit=1153,
+            soft_limit=4096,
+            hard_limit=4096,
+        ),
+    )
+
+    load_balancer.serve_forever(config_path, no_cache=True)
+
+    assert seen["no_cache"] == "1"
+
+
 def test_build_client_uses_effective_worker_concurrency(tmp_path: Path, monkeypatch):
     config_path = tmp_path / "config.yaml"
     upstream_ports = find_free_port_block(1)
@@ -1384,3 +1619,80 @@ def test_build_client_uses_effective_worker_concurrency(tmp_path: Path, monkeypa
     assert isinstance(client, DummyAsyncClient)
     assert seen["limits"].max_connections == 5
     assert seen["limits"].max_keepalive_connections == 5
+
+
+def test_create_app_reads_no_cache_from_env(tmp_path: Path, monkeypatch):
+    config_path = tmp_path / "config.yaml"
+    upstream_ports = find_free_port_block(1)
+    write_config(config_path, upstream_ports, 8001)
+    monkeypatch.setenv(load_balancer.LLM_PROXY_NO_CACHE_ENV, "1")
+    monkeypatch.setattr(
+        load_balancer.LoadBalancerApp,
+        "_initial_healthcheck",
+        lambda self: [
+            load_balancer.EndpointCheckResult(host=host, port=port)
+            for host, port in self.upstream_endpoints
+        ],
+    )
+
+    app = create_app(config_path)
+
+    assert app.no_cache is True
+    assert isinstance(app.message_affinity, load_balancer.InMemoryMessageAffinityStore)
+
+
+def test_configure_process_terminal_output_claims_only_one_worker(tmp_path: Path, monkeypatch):
+    lock_path = tmp_path / "terminal-output.lock"
+    cfg = load_balancer.TunnelConfig(
+        hosts=["worker-1"],
+        port_start=7777,
+        load_balancer_workers=4,
+    )
+    calls = {"count": 0}
+
+    def fake_flock(fd: int, operation: int) -> None:
+        calls["count"] += 1
+        if calls["count"] > 1:
+            raise BlockingIOError
+
+    monkeypatch.setenv(load_balancer.LLM_PROXY_TERMINAL_LOG_LOCK_ENV, str(lock_path))
+    monkeypatch.setattr(load_balancer.fcntl, "flock", fake_flock)
+    monkeypatch.setattr(load_balancer, "_terminal_output_enabled", True)
+    monkeypatch.setattr(load_balancer, "_terminal_log_lock_handle", None)
+
+    assert load_balancer.configure_process_terminal_output(cfg) is True
+
+    first_handle = load_balancer._terminal_log_lock_handle
+    assert first_handle is not None
+    first_handle.close()
+    monkeypatch.setattr(load_balancer, "_terminal_log_lock_handle", None)
+
+    assert load_balancer.configure_process_terminal_output(cfg) is False
+
+
+def test_serve_forever_sets_terminal_log_lock_env(monkeypatch, tmp_path: Path):
+    config_path = tmp_path / "config.yaml"
+    write_config(config_path, [7777], 8123)
+    seen = {}
+
+    def fake_run(*args, **kwargs):
+        seen["terminal_log_lock"] = os.environ[load_balancer.LLM_PROXY_TERMINAL_LOG_LOCK_ENV]
+
+    monkeypatch.setattr(load_balancer.uvicorn, "run", fake_run)
+    monkeypatch.setattr(
+        load_balancer,
+        "plan_file_descriptor_limits",
+        lambda cfg: load_balancer.FileDescriptorPlan(
+            configured_worker_concurrency=512,
+            effective_worker_concurrency=123,
+            required_soft_limit=1153,
+            soft_limit=4096,
+            hard_limit=4096,
+        ),
+    )
+
+    load_balancer.serve_forever(config_path)
+
+    assert seen["terminal_log_lock"] == str(
+        parse_config(config_path).load_balancer_state_db_path.with_suffix(".terminal-output.lock")
+    )

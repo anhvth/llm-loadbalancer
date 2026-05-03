@@ -9,6 +9,7 @@ import dataclasses
 import fcntl
 import hashlib
 import json
+import logging
 import os
 import pathlib
 import queue
@@ -50,7 +51,6 @@ MESSAGE_AFFINITY_INIT_LOCK_RETRY_DELAY_SECONDS = 0.1
 REQUEST_LOGS_DIRNAME = "requests"
 UPSTREAM_TIMEOUT_SECONDS = 300.0
 HEALTHCHECK_TIMEOUT_SECONDS = 2.0
-HEALTHCHECK_INTERVAL_SECONDS = 30.0
 HEALTHCHECK_CONNECT_RETRIES = 3
 HEALTHCHECK_CONNECT_RETRY_DELAY_SECONDS = 0.2
 INITIAL_HEALTHCHECK_TIMEOUT_SECONDS = 15.0
@@ -64,7 +64,18 @@ FD_FALLBACK_SOFT_LIMIT = 1024
 MIN_LISTEN_BACKLOG = 4096
 MAX_LISTEN_BACKLOG = 65535
 LLM_PROXY_EFFECTIVE_WORKER_CONCURRENCY_ENV = "LLM_PROXY_EFFECTIVE_WORKER_CONCURRENCY"
+LLM_PROXY_NO_CACHE_ENV = "LLM_PROXY_NO_CACHE"
 LLM_PROXY_ROUTING_ENV = "LLM_PROXY_ROUTING"
+LLM_PROXY_TERMINAL_LOG_LOCK_ENV = "LLM_PROXY_TERMINAL_LOG_LOCK"
+
+_terminal_output_enabled = True
+_terminal_log_lock_handle: Any | None = None
+
+
+class _TerminalOutputFilter(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:
+        return _terminal_output_enabled
+
 
 logger.remove()
 
@@ -73,7 +84,51 @@ def _log_sink(message):
     sys.stderr.write(str(message))
 
 
-logger.add(_log_sink, format="{message}", level="INFO")
+logger.add(
+    _log_sink,
+    format="{message}",
+    level="INFO",
+    filter=lambda _: _terminal_output_enabled,
+)
+
+_terminal_output_filter = _TerminalOutputFilter()
+
+
+def _configure_uvicorn_terminal_filters() -> None:
+    for logger_name in ("uvicorn", "uvicorn.access"):
+        current_logger = logging.getLogger(logger_name)
+        for handler in current_logger.handlers:
+            if _terminal_output_filter not in handler.filters:
+                handler.addFilter(_terminal_output_filter)
+
+
+def _claim_terminal_output(lock_path: pathlib.Path) -> bool:
+    global _terminal_log_lock_handle
+    if _terminal_log_lock_handle is not None:
+        return True
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    handle = lock_path.open("a+")
+    try:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        handle.close()
+        return False
+    _terminal_log_lock_handle = handle
+    return True
+
+
+def configure_process_terminal_output(cfg: TunnelConfig) -> bool:
+    global _terminal_output_enabled
+    if cfg.load_balancer_workers <= 1:
+        _terminal_output_enabled = True
+    else:
+        raw_lock_path = os.environ.get(LLM_PROXY_TERMINAL_LOG_LOCK_ENV)
+        if raw_lock_path:
+            _terminal_output_enabled = _claim_terminal_output(pathlib.Path(raw_lock_path))
+        else:
+            _terminal_output_enabled = True
+    _configure_uvicorn_terminal_filters()
+    return _terminal_output_enabled
 
 
 @dataclasses.dataclass(frozen=True)
@@ -276,6 +331,17 @@ class AsyncFileLogWriter:
         )
 
 
+class NullLogWriter:
+    def start(self) -> None:
+        return
+
+    def submit(self, payload: dict[str, Any]) -> None:
+        return
+
+    def close(self) -> None:
+        return
+
+
 class SqliteMessageAffinityStore:
     def __init__(self, path: pathlib.Path, max_entries: int):
         self.path = path
@@ -358,6 +424,33 @@ class SqliteMessageAffinityStore:
             )
 
 
+class InMemoryMessageAffinityStore:
+    def __init__(self, max_entries: int):
+        self.max_entries = max_entries
+        self._lock = threading.Lock()
+        self._entries: dict[str, int] = {}
+
+    def close(self) -> None:
+        return
+
+    def get(self, prefix_key: str) -> int | None:
+        with self._lock:
+            upstream_port = self._entries.get(prefix_key)
+            if upstream_port is None:
+                return None
+            self._entries.pop(prefix_key)
+            self._entries[prefix_key] = upstream_port
+            return upstream_port
+
+    def set(self, prefix_key: str, upstream_port: int) -> None:
+        with self._lock:
+            if prefix_key in self._entries:
+                self._entries.pop(prefix_key)
+            self._entries[prefix_key] = upstream_port
+            while len(self._entries) > self.max_entries:
+                self._entries.pop(next(iter(self._entries)))
+
+
 def build_upstream_endpoints(cfg: TunnelConfig) -> list[tuple[str, int]]:
     return [(host, cfg.port_start + index) for index, host in enumerate(cfg.hosts)]
 
@@ -390,9 +483,10 @@ def build_upstream_endpoint_labels(cfg: TunnelConfig) -> dict[tuple[str, int], s
 
 
 class LoadBalancerApp:
-    def __init__(self, cfg: TunnelConfig, verbose: bool = True):
+    def __init__(self, cfg: TunnelConfig, verbose: bool = True, no_cache: bool = False):
         self.cfg = cfg
         self.verbose = verbose
+        self.no_cache = no_cache
         self.effective_worker_concurrency = resolve_effective_worker_concurrency(cfg)
         self.upstream_endpoints = build_upstream_endpoints(cfg)
         self._upstream_targets = build_upstream_targets(cfg)
@@ -408,13 +502,96 @@ class LoadBalancerApp:
         self._last_health_snapshot: dict[str, Any] | None = None
         self.valid_endpoints = self._wait_for_initial_endpoints()
         self.client: httpx.AsyncClient | None = None
-        self.message_affinity = SqliteMessageAffinityStore(
-            cfg.load_balancer_affinity_db_path,
-            MESSAGE_AFFINITY_CACHE_SIZE,
-        )
-        self.log_writer = AsyncFileLogWriter(cfg.load_balancer_log_dir, verbose=verbose)
-        self._healthcheck_task: asyncio.Task[None] | None = None
-        self._healthcheck_stop = asyncio.Event()
+        if self.no_cache:
+            self.message_affinity = InMemoryMessageAffinityStore(MESSAGE_AFFINITY_CACHE_SIZE)
+            self.log_writer = NullLogWriter()
+        else:
+            self.message_affinity = SqliteMessageAffinityStore(
+                cfg.load_balancer_affinity_db_path,
+                MESSAGE_AFFINITY_CACHE_SIZE,
+            )
+            self.log_writer = AsyncFileLogWriter(cfg.load_balancer_log_dir, verbose=verbose)
+
+    def _update_in_memory_health_snapshot(
+        self,
+        snapshot: dict[str, Any],
+        digest: str,
+    ) -> tuple[dict[str, Any] | None, dict[str, Any], bool]:
+        if self._last_health_digest == digest and self._last_health_snapshot is not None:
+            return self._last_health_snapshot, snapshot, False
+        previous_snapshot = self._last_health_snapshot
+        self._last_health_digest = digest
+        self._last_health_snapshot = snapshot
+        return previous_snapshot, snapshot, True
+
+    def _build_stateful_health_payload(
+        self,
+        results: list[EndpointCheckResult],
+    ) -> tuple[dict[str, Any], str]:
+        snapshot = {
+            "connected": len([result for result in results if result.error is None]),
+            "models": sorted({model for result in results if result.error is None for model in result.models}),
+            "endpoints": {},
+        }
+        for result in sorted(results, key=lambda item: (item.host, item.port)):
+            label = self._endpoint_label(result)
+            requests_served = self.endpoint_request_counts.get(label, 0)
+            if result.error is None:
+                snapshot["endpoints"][label] = {
+                    "status": "up",
+                    "models": sorted(set(result.models)),
+                    "requests": requests_served,
+                }
+            else:
+                snapshot["endpoints"][label] = {
+                    "status": "down",
+                    "requests": requests_served,
+                    "error": self._normalize_health_error(result.error),
+                }
+
+        serialized = json.dumps(snapshot, sort_keys=True, separators=(",", ":"))
+        digest = hashlib.sha256(serialized.encode("utf-8")).hexdigest()
+        return snapshot, digest
+
+    def _stateful_health_snapshot(
+        self, results: list[EndpointCheckResult]
+    ) -> tuple[dict[str, Any] | None, dict[str, Any], bool]:
+        snapshot, digest = self._build_stateful_health_payload(results)
+        if self.no_cache:
+            return self._update_in_memory_health_snapshot(snapshot, digest)
+
+        self._health_state_path.parent.mkdir(parents=True, exist_ok=True)
+        payload = {"digest": digest, "snapshot": snapshot}
+        try:
+            with self._health_state_path.open("a+", encoding="utf-8") as handle:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+                handle.seek(0)
+                raw = handle.read().strip()
+                previous: dict[str, Any] = {}
+                if raw:
+                    try:
+                        parsed = json.loads(raw)
+                        if isinstance(parsed, dict):
+                            previous = parsed
+                    except json.JSONDecodeError:
+                        previous = {}
+                previous_snapshot = previous.get("snapshot")
+                if (
+                    isinstance(previous_snapshot, dict)
+                    and previous.get("digest") == digest
+                ):
+                    return previous_snapshot, snapshot, False
+
+                handle.seek(0)
+                handle.truncate()
+                handle.write(json.dumps(payload, sort_keys=True))
+                handle.flush()
+                os.fsync(handle.fileno())
+                if isinstance(previous_snapshot, dict):
+                    return previous_snapshot, snapshot, True
+                return None, snapshot, True
+        except OSError:
+            return self._update_in_memory_health_snapshot(snapshot, digest)
 
     def _endpoint_label(self, endpoint: EndpointCheckResult) -> str:
         return self.upstream_endpoint_labels.get(
@@ -479,72 +656,6 @@ class LoadBalancerApp:
             return True
         text = str(error)
         return "Connection refused" in text or "All connection attempts failed" in text
-
-    def _stateful_health_snapshot(
-        self, results: list[EndpointCheckResult]
-    ) -> tuple[dict[str, Any] | None, dict[str, Any], bool]:
-        valid_results = [result for result in results if result.error is None]
-        snapshot = {
-            "connected": len(valid_results),
-            "models": sorted({model for result in valid_results for model in result.models}),
-            "endpoints": {},
-        }
-        for result in sorted(results, key=lambda item: (item.host, item.port)):
-            label = self._endpoint_label(result)
-            requests_served = self.endpoint_request_counts.get(label, 0)
-            if result.error is None:
-                snapshot["endpoints"][label] = {
-                    "status": "up",
-                    "models": sorted(set(result.models)),
-                    "requests": requests_served,
-                }
-            else:
-                snapshot["endpoints"][label] = {
-                    "status": "down",
-                    "requests": requests_served,
-                    "error": self._normalize_health_error(result.error),
-                }
-
-        serialized = json.dumps(snapshot, sort_keys=True, separators=(",", ":"))
-        digest = hashlib.sha256(serialized.encode("utf-8")).hexdigest()
-        self._health_state_path.parent.mkdir(parents=True, exist_ok=True)
-        payload = {"digest": digest, "snapshot": snapshot}
-
-        try:
-            with self._health_state_path.open("a+", encoding="utf-8") as handle:
-                fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
-                handle.seek(0)
-                raw = handle.read().strip()
-                previous: dict[str, Any] = {}
-                if raw:
-                    try:
-                        parsed = json.loads(raw)
-                        if isinstance(parsed, dict):
-                            previous = parsed
-                    except json.JSONDecodeError:
-                        previous = {}
-                previous_snapshot = previous.get("snapshot")
-                if (
-                    isinstance(previous_snapshot, dict)
-                    and previous.get("digest") == digest
-                ):
-                    return previous_snapshot, snapshot, False
-
-                handle.seek(0)
-                handle.truncate()
-                handle.write(json.dumps(payload, sort_keys=True))
-                handle.flush()
-                os.fsync(handle.fileno())
-                if isinstance(previous_snapshot, dict):
-                    return previous_snapshot, snapshot, True
-                return None, snapshot, True
-        except OSError:
-            if self._last_health_digest == digest and self._last_health_snapshot is not None:
-                return self._last_health_snapshot, snapshot, False
-            previous_snapshot = self._last_health_snapshot
-            self._last_health_digest = digest
-            self._last_health_snapshot = snapshot
-            return previous_snapshot, snapshot, True
 
     def _probe_models_sync(self, client: httpx.Client, endpoint: tuple[str, int]) -> tuple[tuple[str, ...], str | None]:
         models: tuple[str, ...] = ()
@@ -673,7 +784,7 @@ class LoadBalancerApp:
         logger.info("\n".join(lines))
 
     def _initial_healthcheck(self) -> list[EndpointCheckResult]:
-        with httpx.Client(timeout=HEALTHCHECK_TIMEOUT_SECONDS) as client:
+        with httpx.Client(timeout=HEALTHCHECK_TIMEOUT_SECONDS, trust_env=False) as client:
             results = [self._check_endpoint_sync(client, endpoint) for endpoint in self.upstream_endpoints]
         self._summarize_health(results)
         return [result for result in results if result.error is None]
@@ -690,7 +801,7 @@ class LoadBalancerApp:
         raise RuntimeError("No valid endpoints after healthcheck")
 
     async def refresh_health(self) -> None:
-        async with httpx.AsyncClient(timeout=HEALTHCHECK_TIMEOUT_SECONDS) as client:
+        async with httpx.AsyncClient(timeout=HEALTHCHECK_TIMEOUT_SECONDS, trust_env=False) as client:
             results = await asyncio.gather(
                 *(self._check_endpoint_async(client, endpoint) for endpoint in self.upstream_endpoints)
             )
@@ -698,20 +809,6 @@ class LoadBalancerApp:
         if valid_results or not self.valid_endpoints:
             self.valid_endpoints = valid_results
         self._summarize_health(list(results))
-
-    async def _healthcheck_loop(self) -> None:
-        try:
-            while not self._healthcheck_stop.is_set():
-                await self.refresh_health()
-                try:
-                    await asyncio.wait_for(
-                        self._healthcheck_stop.wait(),
-                        timeout=HEALTHCHECK_INTERVAL_SECONDS,
-                    )
-                except asyncio.TimeoutError:
-                    continue
-        except asyncio.CancelledError:
-            return
 
     async def __call__(self, scope, receive, send) -> None:
         scope_type = scope["type"]
@@ -731,18 +828,8 @@ class LoadBalancerApp:
             if message["type"] == "lifespan.startup":
                 self.client = self._build_client()
                 self.log_writer.start()
-                self._healthcheck_stop.clear()
-                self._healthcheck_task = asyncio.create_task(self._healthcheck_loop())
                 await send({"type": "lifespan.startup.complete"})
             elif message["type"] == "lifespan.shutdown":
-                self._healthcheck_stop.set()
-                if self._healthcheck_task is not None:
-                    self._healthcheck_task.cancel()
-                    try:
-                        await self._healthcheck_task
-                    except asyncio.CancelledError:
-                        pass
-                    self._healthcheck_task = None
                 if self.client is not None:
                     await self.client.aclose()
                     self.client = None
@@ -762,7 +849,7 @@ class LoadBalancerApp:
             write=UPSTREAM_TIMEOUT_SECONDS,
             pool=UPSTREAM_TIMEOUT_SECONDS,
         )
-        return httpx.AsyncClient(timeout=timeout, limits=limits)
+        return httpx.AsyncClient(timeout=timeout, limits=limits, trust_env=False)
 
     async def _handle_http(self, scope, receive, send) -> None:
         valid_endpoints = list(self.valid_endpoints)
@@ -801,6 +888,7 @@ class LoadBalancerApp:
         try:
             response = await client.send(request, stream=True)
         except httpx.HTTPError as exc:
+            await self.refresh_health()
             await self._send_plain_error(send, 502, f"Upstream request failed: {exc}".encode("utf-8"))
             return
 
@@ -1161,29 +1249,46 @@ def resolve_config_path(config_path: pathlib.Path | None = None) -> pathlib.Path
     ).expanduser()
 
 
-def create_app(config_path: pathlib.Path | None = None, verbose: bool | None = None) -> LoadBalancerApp:
+def create_app(
+    config_path: pathlib.Path | None = None,
+    verbose: bool | None = None,
+    no_cache: bool | None = None,
+) -> LoadBalancerApp:
     cfg = parse_config(resolve_config_path(config_path))
+    configure_process_terminal_output(cfg)
     routing = os.environ.get(LLM_PROXY_ROUTING_ENV)
     if routing is not None:
         cfg = dataclasses.replace(cfg, load_balancer_routing=routing)
     if verbose is None:
         verbose = os.environ.get("LLM_PROXY_VERBOSE", "0") == "1"
-    return LoadBalancerApp(cfg, verbose=verbose)
+    if no_cache is None:
+        no_cache = os.environ.get(LLM_PROXY_NO_CACHE_ENV, "0") == "1"
+    return LoadBalancerApp(cfg, verbose=verbose, no_cache=no_cache)
 
 
 def serve_forever(
     config_path: pathlib.Path = pathlib.Path("~/.config/llm-proxy.yaml").expanduser(),
     verbose: bool = True,
     routing: str | None = None,
+    no_cache: bool = False,
+    reload: bool = False,
 ) -> None:
     cfg = parse_config(config_path)
     if routing is not None:
         cfg = dataclasses.replace(cfg, load_balancer_routing=routing)
     fd_plan = plan_file_descriptor_limits(cfg)
+    previous_no_cache = os.environ.get(LLM_PROXY_NO_CACHE_ENV)
+    had_previous_no_cache = LLM_PROXY_NO_CACHE_ENV in os.environ
     previous_routing = os.environ.get(LLM_PROXY_ROUTING_ENV)
     had_previous_routing = LLM_PROXY_ROUTING_ENV in os.environ
+    previous_terminal_log_lock = os.environ.get(LLM_PROXY_TERMINAL_LOG_LOCK_ENV)
+    had_previous_terminal_log_lock = LLM_PROXY_TERMINAL_LOG_LOCK_ENV in os.environ
     os.environ["LLM_PROXY_CONFIG"] = str(config_path)
     os.environ["LLM_PROXY_VERBOSE"] = "1" if verbose else "0"
+    os.environ[LLM_PROXY_NO_CACHE_ENV] = "1" if no_cache else "0"
+    os.environ[LLM_PROXY_TERMINAL_LOG_LOCK_ENV] = str(
+        cfg.load_balancer_state_db_path.with_suffix(".terminal-output.lock")
+    )
     if routing is None:
         os.environ.pop(LLM_PROXY_ROUTING_ENV, None)
     else:
@@ -1207,27 +1312,42 @@ def serve_forever(
             fd_plan.required_soft_limit,
         )
     try:
-        uvicorn.run(
-            f"{create_app.__module__}:create_app",
-            factory=True,
-            host="127.0.0.1",
-            port=cfg.listen_port,
-            workers=cfg.load_balancer_workers,
-            limit_concurrency=fd_plan.effective_worker_concurrency,
-            backlog=listen_backlog_for_worker_concurrency(
+        run_kwargs = {
+            "factory": True,
+            "host": "127.0.0.1",
+            "port": cfg.listen_port,
+            "workers": cfg.load_balancer_workers,
+            "limit_concurrency": fd_plan.effective_worker_concurrency,
+            "backlog": listen_backlog_for_worker_concurrency(
                 cfg,
                 fd_plan.effective_worker_concurrency,
             ),
-            timeout_keep_alive=30,
-            access_log=False,
-            log_level="info",
+            "timeout_keep_alive": 30,
+            "access_log": False,
+            "log_level": "info",
+        }
+        if reload:
+            run_kwargs["reload"] = True
+        uvicorn.run(
+            f"{create_app.__module__}:create_app",
+            **run_kwargs,
         )
     finally:
+        if had_previous_no_cache:
+            assert previous_no_cache is not None
+            os.environ[LLM_PROXY_NO_CACHE_ENV] = previous_no_cache
+        else:
+            os.environ.pop(LLM_PROXY_NO_CACHE_ENV, None)
         if had_previous_routing:
             assert previous_routing is not None
             os.environ[LLM_PROXY_ROUTING_ENV] = previous_routing
         else:
             os.environ.pop(LLM_PROXY_ROUTING_ENV, None)
+        if had_previous_terminal_log_lock:
+            assert previous_terminal_log_lock is not None
+            os.environ[LLM_PROXY_TERMINAL_LOG_LOCK_ENV] = previous_terminal_log_lock
+        else:
+            os.environ.pop(LLM_PROXY_TERMINAL_LOG_LOCK_ENV, None)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -1246,13 +1366,18 @@ def main(argv: list[str] | None = None) -> int:
         help="Disable verbose logging to terminal",
     )
     parser.add_argument(
+        "--no-cache",
+        action="store_true",
+        help="Disable filesystem-backed cache data like request logs, health state, and affinity DB",
+    )
+    parser.add_argument(
         "--routing",
         choices=("random", "smart"),
         help="Routing mode. random disables message affinity; smart keeps affinity.",
     )
     args = parser.parse_args(argv)
     verbose = not args.silent and os.environ.get("LLM_PROXY_VERBOSE", "1") == "1"
-    serve_forever(args.config, verbose=verbose, routing=args.routing)
+    serve_forever(args.config, verbose=verbose, routing=args.routing, no_cache=args.no_cache)
     return 0
 
 

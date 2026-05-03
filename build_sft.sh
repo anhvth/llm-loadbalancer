@@ -4,7 +4,7 @@ set -e
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CACHE_DIR="${CACHE_DIR:-$HOME/.cache/llm-proxy/training-data}"
 MINIMAX_TOKENIZER_PATH="${MINIMAX_TOKENIZER_PATH:-$HOME/ckpt/hf_models/MiniMaxAI/MiniMax-M2.7/}"
-QWEN3_TOKENIZER_PATH="${QWEN3_TOKENIZER_PATH:-$HOME/ckpt/hf_models/Qwen/Qwen3.5-27B/}"
+QWEN3_TOKENIZER_PATH="${QWEN3_TOKENIZER_PATH:-$HOME/ckpt/hf_models/Qwen/Qwen3.6-27B/}"
 
 usage() {
     echo "Usage: $0 [--minimax|--qwen3]"
