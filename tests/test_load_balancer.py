@@ -738,6 +738,164 @@ def test_handle_http_does_not_refresh_health_for_upstream_5xx(monkeypatch, tmp_p
     assert sent[2] == {"type": "http.response.body", "body": b"", "more_body": False}
 
 
+def test_handle_http_cancels_pending_upstream_send_when_client_disconnects(
+    monkeypatch,
+    tmp_path: Path,
+):
+    config_path = tmp_path / "config.yaml"
+    upstream_ports = find_free_port_block(1)
+    write_config(config_path, upstream_ports, 8001)
+
+    monkeypatch.setattr(
+        load_balancer.LoadBalancerApp,
+        "_initial_healthcheck",
+        lambda self: [
+            load_balancer.EndpointCheckResult(host=host, port=port)
+            for host, port in self.upstream_endpoints
+        ],
+    )
+
+    app = create_app(config_path)
+
+    async def run_scenario():
+        send_started = asyncio.Event()
+        send_cancelled = False
+
+        class PendingAsyncClient:
+            def build_request(self, method, url, headers=None, content=None):
+                return httpx.Request(method, url, headers=headers, content=content)
+
+            async def send(self, request, stream=True):
+                nonlocal send_cancelled
+                send_started.set()
+                try:
+                    await asyncio.Event().wait()
+                except asyncio.CancelledError:
+                    send_cancelled = True
+                    raise
+
+        app.client = PendingAsyncClient()
+
+        receive_calls = 0
+        sent: list[dict[str, object]] = []
+        scope = {
+            "type": "http",
+            "method": "POST",
+            "path": "/v1/chat/completions",
+            "raw_path": b"/v1/chat/completions",
+            "query_string": b"",
+            "headers": [(b"content-type", b"application/json")],
+        }
+
+        async def receive():
+            nonlocal receive_calls
+            receive_calls += 1
+            if receive_calls == 1:
+                return {
+                    "type": "http.request",
+                    "body": b'{"model":"demo","messages":[{"role":"user","content":"hi"}]}',
+                    "more_body": False,
+                }
+            await send_started.wait()
+            return {"type": "http.disconnect"}
+
+        async def send(message):
+            sent.append(message)
+
+        await asyncio.wait_for(app._handle_http(scope, receive, send), timeout=1.0)
+        return send_cancelled, sent
+
+    send_cancelled, sent = asyncio.run(run_scenario())
+
+    assert send_cancelled is True
+    assert sent == []
+
+
+def test_handle_http_cancels_upstream_when_client_disconnects(monkeypatch, tmp_path: Path):
+    config_path = tmp_path / "config.yaml"
+    upstream_ports = find_free_port_block(1)
+    write_config(config_path, upstream_ports, 8001)
+
+    monkeypatch.setattr(
+        load_balancer.LoadBalancerApp,
+        "_initial_healthcheck",
+        lambda self: [
+            load_balancer.EndpointCheckResult(host=host, port=port)
+            for host, port in self.upstream_endpoints
+        ],
+    )
+
+    disconnect_ready = asyncio.Event()
+
+    class FakeResponse:
+        def __init__(self):
+            self.status_code = 200
+            self.headers = {"content-type": "text/event-stream"}
+            self.closed = False
+            self.cancelled = False
+
+        async def aiter_raw(self):
+            yield b"data: one\n\n"
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                self.cancelled = True
+                raise
+
+        async def aclose(self):
+            self.closed = True
+            return None
+
+    response = FakeResponse()
+
+    class SuccessfulAsyncClient:
+        def build_request(self, method, url, headers=None, content=None):
+            return httpx.Request(method, url, headers=headers, content=content)
+
+        async def send(self, request, stream=True):
+            return response
+
+    app = create_app(config_path)
+    app.client = SuccessfulAsyncClient()
+
+    receive_calls = 0
+    sent: list[dict[str, object]] = []
+    scope = {
+        "type": "http",
+        "method": "GET",
+        "path": "/stream",
+        "raw_path": b"/stream",
+        "query_string": b"",
+        "headers": [],
+    }
+
+    async def receive():
+        nonlocal receive_calls
+        receive_calls += 1
+        if receive_calls == 1:
+            return {"type": "http.request", "body": b"", "more_body": False}
+        await disconnect_ready.wait()
+        return {"type": "http.disconnect"}
+
+    async def send(message):
+        sent.append(message)
+        if message["type"] == "http.response.body" and message.get("more_body"):
+            disconnect_ready.set()
+
+    asyncio.run(asyncio.wait_for(app._handle_http(scope, receive, send), timeout=1.0))
+
+    assert response.cancelled is True
+    assert response.closed is True
+    assert sent == [
+        {
+            "type": "http.response.start",
+            "status": 200,
+            "headers": [(b"content-type", b"text/event-stream"), (b"connection", b"close")],
+        },
+        {"type": "http.response.body", "body": b"data: one\n\n", "more_body": True},
+    ]
+
+
 def test_proxies_large_post_payload(tmp_path: Path):
     config_path = tmp_path / "config.yaml"
     upstream_ports = find_free_port_block(2)

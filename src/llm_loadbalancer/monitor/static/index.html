@@ -1,0 +1,338 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>LLM Proxy Monitor</title>
+<style>
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+:root{--bg:#0d1117;--card:#161b22;--border:#30363d;--text:#c9d1d9;--text-muted:#8b949e;--green:#3fb950;--red:#f85149;--blue:#58a6ff;--yellow:#d29922}
+body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;background:var(--bg);color:var(--text);padding:20px;font-size:14px}
+h1{font-size:20px;font-weight:600;margin-bottom:16px;display:flex;align-items:center;gap:8px}
+h1 small{font-size:12px;font-weight:400;color:var(--text-muted);margin-left:auto}
+.grid{display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-bottom:16px}
+.card{background:var(--card);border:1px solid var(--border);border-radius:8px;padding:16px}
+.card h2{font-size:13px;font-weight:600;color:var(--text-muted);text-transform:uppercase;letter-spacing:.5px;margin-bottom:12px}
+.stat-row{display:flex;justify-content:space-between;padding:4px 0}
+.stat-label{color:var(--text-muted)}
+.stat-value{font-weight:600;font-variant-numeric:tabular-nums}
+.full{grid-column:1/-1}
+.bar-chart{margin-top:8px}
+.bar-row{display:flex;align-items:center;gap:8px;margin-bottom:6px}
+.bar-label{width:120px;text-align:right;font-size:12px;color:var(--text-muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.bar-track{flex:1;height:20px;background:var(--bg);border-radius:4px;overflow:hidden}
+.bar-fill{height:100%;border-radius:4px;transition:width .5s ease}
+.bar-count{width:70px;text-align:right;font-size:12px;color:var(--text-muted);font-variant-numeric:tabular-nums}
+
+/* Per-endpoint card styles */
+.endpoint-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(320px,1fr));gap:12px;margin-bottom:16px}
+.ep-card{background:var(--card);border:1px solid var(--border);border-radius:8px;padding:14px;font-family:ui-monospace,SFMono-Regular,'SF Mono',Menlo,Consolas,monospace;font-size:13px}
+.ep-card .ep-title{font-size:14px;font-weight:600;margin-bottom:10px;display:flex;align-items:center;gap:8px}
+.ep-card .ep-row{display:flex;justify-content:space-between;align-items:center;padding:2px 0}
+.ep-card .ep-label{color:var(--text-muted)}
+.ep-card .ep-value{font-weight:600;font-variant-numeric:tabular-nums}
+.ep-card .ep-bar{border-radius:4px;overflow:hidden;display:flex;margin:2px 0;height:18px;background:var(--bg)}
+.ep-card .ep-bar-fill{height:100%;border-radius:4px;transition:width .5s ease;min-width:2px}
+.ep-bar-red .ep-bar-fill{background:var(--red)}
+.ep-bar-green .ep-bar-fill{background:var(--green)}
+.ep-bar-yellow .ep-bar-fill{background:var(--yellow)}
+.ep-bar-blue .ep-bar-fill{background:var(--blue)}
+.preemptions-warn{color:var(--red);font-weight:700}
+.dot{display:inline-block;width:8px;height:8px;border-radius:50%;margin-right:6px}
+.dot-up{background:var(--green)}
+.dot-down{background:var(--red)}
+table{width:100%;border-collapse:collapse;font-size:12px}
+th{text-align:left;padding:6px 8px;color:var(--text-muted);border-bottom:1px solid var(--border);font-weight:600;text-transform:uppercase;font-size:11px}
+td{padding:6px 8px;border-bottom:1px solid var(--border);font-variant-numeric:tabular-nums}
+td:first-child,th:first-child{padding-left:0}
+td:last-child,th:last-child{padding-right:0}
+tr:last-child td{border-bottom:none}
+.status-badge{display:inline-flex;align-items:center;gap:4px;padding:2px 8px;border-radius:12px;font-size:11px;font-weight:600}
+.status-up{background:rgba(63,185,80,.15);color:var(--green)}
+.status-down{background:rgba(248,81,69,.15);color:var(--red)}
+#error-banner{display:none;background:rgba(248,81,69,.1);border:1px solid var(--red);color:var(--red);padding:10px 16px;border-radius:8px;margin-bottom:16px;font-size:13px}
+@media(max-width:768px){.grid{grid-template-columns:1fr}}
+</style>
+</head>
+<body>
+
+<div id="error-banner"></div>
+
+<h1>
+  <span id="indicator">&#9679;</span>
+  LLM Proxy Monitor
+  <small>Last refresh: <span id="last-refresh">—</span></small>
+</h1>
+
+<div class="grid">
+  <div class="card">
+    <h2>Cluster Health</h2>
+    <div id="health-content">
+      <div class="stat-row"><span class="stat-label">Connected Workers</span><span class="stat-value" id="h-connected">—</span></div>
+      <div class="stat-row"><span class="stat-label">Workers Up</span><span class="stat-value" id="h-up">—</span></div>
+      <div class="stat-row"><span class="stat-label">Workers Down</span><span class="stat-value" id="h-down">—</span></div>
+      <div class="stat-row"><span class="stat-label">Total Requests (lifetime)</span><span class="stat-value" id="h-total-reqs">—</span></div>
+      <div class="stat-row"><span class="stat-label">Models</span><span class="stat-value" id="h-models">—</span></div>
+      <div style="margin-top:12px" id="h-workers"></div>
+    </div>
+  </div>
+  <div class="card">
+    <h2>Live Stats <small style="font-weight:400;text-transform:none;color:var(--text-muted)">(last <span id="window-label">60</span>s)</small></h2>
+    <div id="stats-content">
+      <div class="stat-row"><span class="stat-label">Requests</span><span class="stat-value" id="s-requests">—</span></div>
+      <div class="stat-row"><span class="stat-label">Prompt Tokens</span><span class="stat-value" id="s-prompt">—</span></div>
+      <div class="stat-row"><span class="stat-label">Completion Tokens</span><span class="stat-value" id="s-completion">—</span></div>
+      <div class="stat-row"><span class="stat-label">Total Tokens</span><span class="stat-value" id="s-total-tokens">—</span></div>
+      <div class="stat-row"><span class="stat-label">Mean Latency</span><span class="stat-value" id="s-mean-lat">—</span></div>
+      <div class="stat-row"><span class="stat-label">Median Latency</span><span class="stat-value" id="s-median-lat">—</span></div>
+    </div>
+  </div>
+</div>
+
+<div class="card full" style="margin-bottom:16px">
+  <h2>Live Endpoints</h2>
+  <div class="endpoint-grid" id="endpoint-cards"></div>
+</div>
+
+<div class="grid">
+  <div class="card full">
+    <h2>Routing Distribution</h2>
+    <div class="bar-chart" id="route-chart"></div>
+  </div>
+</div>
+
+<div class="grid">
+  <div class="card full">
+    <h2>Recent Requests</h2>
+    <div style="max-height:400px;overflow-y:auto">
+      <table>
+        <thead><tr><th>Time</th><th>Worker</th><th>Route</th><th>Model</th><th>Prompt</th><th>Completion</th></tr></thead>
+        <tbody id="requests-body"></tbody>
+      </table>
+    </div>
+  </div>
+</div>
+
+<script>
+const COLORS = ['#58a6ff','#3fb950','#d29922','#f85149','#bc8cff','#f0883e','#79c0ff','#56d364'];
+
+function fmt(n) {
+  if (n === undefined || n === null) return '—';
+  if (typeof n === 'number' && n >= 1000) return n.toLocaleString();
+  return String(n);
+}
+
+function fmtTime(tsNs) {
+  const ms = Math.floor(tsNs / 1_000_000);
+  const d = new Date(ms);
+  return d.toLocaleTimeString();
+}
+
+function showError(msg) {
+  const el = document.getElementById('error-banner');
+  el.textContent = msg;
+  el.style.display = 'block';
+}
+
+function hideError() {
+  document.getElementById('error-banner').style.display = 'none';
+}
+
+const MAX_NUM_SEQS = 64;
+
+function barColorCls(pct) {
+  if (pct >= 80) return 'red';
+  if (pct >= 50) return 'yellow';
+  return 'green';
+}
+
+function renderBar(pct, label) {
+  const w = Math.min(pct, 100);
+  return '<div class="ep-bar ep-bar-' + barColorCls(pct) + '"><div class="ep-bar-fill" style="width:' + w + '%"></div></div>';
+}
+
+function renderEndpointCards(data) {
+  const el = document.getElementById('endpoint-cards');
+  const eps = data.endpoints || {};
+  const entries = Object.entries(eps);
+  if (entries.length === 0) {
+    el.innerHTML = '<div style="color:var(--text-muted);grid-column:1/-1;padding:16px">No endpoints found</div>';
+    return;
+  }
+  let html = '';
+  for (const [name, ep] of entries) {
+    const isUp = ep.status === 'up';
+    const running = ep.requests_running ?? 0;
+    const waiting = ep.requests_waiting ?? 0;
+    const kvPct = ep.kv_cache_pct ?? 0;
+    const runPct = MAX_NUM_SEQS > 0 ? (running / MAX_NUM_SEQS * 100) : 0;
+    const waitPct = Math.min(waiting / 100 * 100, 100);
+    const preemptions = ep.preemptions ?? 0;
+    const served = ep.requests_served ?? 0;
+    const model = ep.model || '—';
+
+    html += '<div class="ep-card">' +
+      '<div class="ep-title">' +
+        '<span class="status-badge status-' + (isUp ? 'up' : 'down') + '"><span class="dot dot-' + (isUp ? 'up' : 'down') + '"></span>' + name + '</span>' +
+        '<span style="font-weight:400;font-size:12px;color:var(--text-muted);margin-left:auto">' + model + '</span>' +
+      '</div>' +
+      '<div class="ep-row"><span class="ep-label">Running</span><span class="ep-value">' + fmt(running) + ' / ' + MAX_NUM_SEQS + '</span></div>' +
+      renderBar(runPct, fmt(running) + ' / ' + MAX_NUM_SEQS) +
+      '<div class="ep-row"><span class="ep-label">Waiting</span><span class="ep-value">' + fmt(waiting) + '</span></div>' +
+      renderBar(waitPct, fmt(waiting)) +
+      '<div class="ep-row"><span class="ep-label">KV Cache</span><span class="ep-value">' + kvPct + '%</span></div>' +
+      renderBar(kvPct, kvPct + '%') +
+      '<div class="ep-row" style="margin-top:6px">' +
+        '<span class="ep-label">Reqs served</span>' +
+        '<span class="ep-value">' + fmt(served) + '</span>' +
+      '</div>' +
+      '<div class="ep-row">' +
+        '<span class="ep-label">Preemptions</span>' +
+        '<span class="ep-value' + (preemptions > 0 ? ' preemptions-warn' : '') + '">' + fmt(preemptions) + '</span>' +
+      '</div>' +
+    '</div>';
+  }
+  el.innerHTML = html;
+}
+
+function renderBars(containerId, items, maxCount) {
+  const el = document.getElementById(containerId);
+  if (!items || items.length === 0) {
+    el.innerHTML = '<div style="color:var(--text-muted);padding:8px 0">No data</div>';
+    return;
+  }
+  const max = maxCount || items[0].count;
+  let html = '';
+  items.forEach((item, i) => {
+    const pct = max > 0 ? (item.count / max * 100).toFixed(0) : 0;
+    const color = COLORS[i % COLORS.length];
+    html += '<div class="bar-row">' +
+      '<span class="bar-label">' + item.name + '</span>' +
+      '<div class="bar-track"><div class="bar-fill" style="width:' + pct + '%;background:' + color + '"></div></div>' +
+      '<span class="bar-count">' + fmt(item.count) + '</span>' +
+    '</div>';
+  });
+  el.innerHTML = html;
+}
+
+async function fetchHealth() {
+  try {
+    const r = await fetch('/api/health');
+    if (!r.ok) throw new Error('Health endpoint returned ' + r.status);
+    const d = await r.json();
+    hideError();
+
+    const snap = d.snapshot || {};
+    const eps = snap.endpoints || {};
+    const entries = Object.entries(eps);
+    const up = entries.filter(([,v]) => v.status === 'up').length;
+    const down = entries.filter(([,v]) => v.status !== 'up').length;
+    const totalReqs = entries.reduce((s, [,v]) => s + (v.requests || 0), 0);
+
+    document.getElementById('h-connected').textContent = fmt(entries.length);
+    document.getElementById('h-up').textContent = fmt(up);
+    document.getElementById('h-down').textContent = fmt(down);
+    document.getElementById('h-total-reqs').textContent = fmt(totalReqs);
+    document.getElementById('h-models').textContent = (snap.models || []).map(m => m.split('/').pop()).join(', ') || '—';
+
+    let whtml = '';
+    entries.forEach(([name, v]) => {
+      const s = v.status === 'up' ? 'up' : 'down';
+      whtml += '<div style="display:flex;align-items:center;gap:8px;margin-bottom:4px;font-size:12px">' +
+        '<span class="status-badge status-' + s + '"><span class="dot dot-' + s + '"></span>' + name + '</span>' +
+        '<span style="color:var(--text-muted)">' + fmt(v.requests) + ' req</span>' +
+      '</div>';
+    });
+    document.getElementById('h-workers').innerHTML = whtml;
+  } catch (e) {
+    showError('Cannot reach health endpoint: ' + e.message);
+  }
+}
+
+async function fetchStats() {
+  try {
+    const r = await fetch('/api/stats?window=60');
+    if (!r.ok) throw new Error('Stats endpoint returned ' + r.status);
+    const d = await r.json();
+    hideError();
+
+    document.getElementById('window-label').textContent = d.window;
+    document.getElementById('s-requests').textContent = fmt(d.total);
+    document.getElementById('s-prompt').textContent = fmt(d.prompt_tokens);
+    document.getElementById('s-completion').textContent = fmt(d.completion_tokens);
+    document.getElementById('s-total-tokens').textContent = fmt(d.total_tokens);
+    document.getElementById('s-mean-lat').textContent = d.mean_latency ? d.mean_latency + 's' : '—';
+    document.getElementById('s-median-lat').textContent = d.median_latency ? d.median_latency + 's' : '—';
+
+    renderBars('worker-chart', d.per_endpoint, null);
+    renderBars('route-chart', d.per_route, null);
+  } catch (e) {
+    showError('Cannot reach stats endpoint: ' + e.message);
+  }
+}
+
+async function fetchEndpointsLive() {
+  try {
+    const r = await fetch('/api/endpoints/live');
+    if (!r.ok) throw new Error('Endpoints/live returned ' + r.status);
+    const d = await r.json();
+    hideError();
+    renderEndpointCards(d);
+    // show banner only if ALL endpoints are down
+    const eps = Object.values(d.endpoints || {});
+    if (eps.length > 0 && eps.every(e => e.status !== 'up')) {
+      showError('All endpoints are currently DOWN');
+    }
+  } catch (e) {
+    console.warn('fetchEndpointsLive failed:', e);
+  }
+}
+
+async function fetchRequests() {
+  try {
+    const r = await fetch('/api/requests?limit=50');
+    if (!r.ok) throw new Error('Requests endpoint returned ' + r.status);
+    const d = await r.json();
+    hideError();
+
+    const tbody = document.getElementById('requests-body');
+    if (!d.items || d.items.length === 0) {
+      tbody.innerHTML = '<tr><td colspan="6" style="text-align:center;color:var(--text-muted);padding:20px">No requests logged yet</td></tr>';
+      return;
+    }
+
+    let html = '';
+    d.items.forEach(item => {
+      const ep = item.endpoint_used ? item.endpoint_used.replace(/^https?:\/\//, '').split(':')[0] : '—';
+      html += '<tr>' +
+        '<td>' + (item.timestamp_ns ? fmtTime(item.timestamp_ns) : '—') + '</td>' +
+        '<td>' + ep + '</td>' +
+        '<td>' + (item.route_reason || '—') + '</td>' +
+        '<td>' + (item.model ? item.model.split('/').pop() : '—') + '</td>' +
+        '<td>' + fmt(item.prompt_tokens) + '</td>' +
+        '<td>' + fmt(item.completion_tokens) + '</td>' +
+      '</tr>';
+    });
+    tbody.innerHTML = html;
+  } catch (e) {
+    showError('Cannot reach requests endpoint: ' + e.message);
+  }
+}
+
+function updateRefreshTime() {
+  document.getElementById('last-refresh').textContent = new Date().toLocaleTimeString();
+}
+
+async function refreshAll() {
+  await Promise.all([fetchHealth(), fetchStats(), fetchEndpointsLive(), fetchRequests()]);
+  updateRefreshTime();
+}
+
+// Initial load
+refreshAll();
+
+// Poll every 5 seconds
+setInterval(refreshAll, 5000);
+</script>
+</body>
+</html>

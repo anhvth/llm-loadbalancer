@@ -1,1 +1,3 @@
-uv run llm-proxy --no-cache
+pkill llm-proxy
+/home/anhvth8/projects/llm-loadbalancer/.venv/bin/llm-proxy  --no-cache
+

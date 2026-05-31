@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+from contextlib import suppress
 import dataclasses
 import fcntl
 import hashlib
@@ -867,6 +868,8 @@ class LoadBalancerApp:
         request_chunks = bytearray()
         while True:
             message = await receive()
+            if message["type"] == "http.disconnect":
+                return
             if message["type"] != "http.request":
                 continue
             body = message.get("body", b"")
@@ -885,12 +888,40 @@ class LoadBalancerApp:
         headers = self._build_upstream_headers(scope["headers"], upstream_port)
         request = client.build_request(method, upstream_url, headers=headers, content=request_body)
 
+        disconnect_task: asyncio.Task[None] | None = asyncio.create_task(
+            self._wait_for_http_disconnect(receive)
+        )
+        upstream_task: asyncio.Task[Any] | None = asyncio.create_task(
+            client.send(request, stream=True)
+        )
+        response = None
         try:
-            response = await client.send(request, stream=True)
+            done, _ = await asyncio.wait(
+                {upstream_task, disconnect_task},
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if disconnect_task in done:
+                disconnect_task.result()
+                upstream_task.cancel()
+                with suppress(asyncio.CancelledError, httpx.HTTPError):
+                    response = await upstream_task
+                if response is not None:
+                    await response.aclose()
+                return
+            response = await upstream_task
         except httpx.HTTPError as exc:
+            if disconnect_task is not None:
+                disconnect_task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await disconnect_task
             await self.refresh_health()
             await self._send_plain_error(send, 502, f"Upstream request failed: {exc}".encode("utf-8"))
             return
+        finally:
+            if response is None and upstream_task is not None and not upstream_task.done():
+                upstream_task.cancel()
+                with suppress(asyncio.CancelledError, httpx.HTTPError):
+                    await upstream_task
 
         endpoint_label = self._endpoint_label_by_port.get(
             upstream_port,
@@ -908,21 +939,54 @@ class LoadBalancerApp:
         response_headers.append((b"connection", b"close"))
         response_chunks = bytearray()
 
-        await send(
-            {
-                "type": "http.response.start",
-                "status": response.status_code,
-                "headers": response_headers,
-            }
-        )
+        relay_task: asyncio.Task[None] | None = None
+        client_disconnected = False
 
         try:
-            async for chunk in response.aiter_raw():
-                if chunk:
-                    response_chunks.extend(chunk)
-                await send({"type": "http.response.body", "body": chunk, "more_body": True})
+            if disconnect_task is not None and disconnect_task.done():
+                disconnect_task.result()
+                client_disconnected = True
+                return
+
+            await send(
+                {
+                    "type": "http.response.start",
+                    "status": response.status_code,
+                    "headers": response_headers,
+                }
+            )
+
+            disconnect_event = asyncio.Event()
+            relay_task = asyncio.create_task(
+                self._relay_upstream_response(response, send, response_chunks, disconnect_event)
+            )
+
+            done, _ = await asyncio.wait(
+                {relay_task, disconnect_task},
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if disconnect_task in done:
+                disconnect_task.result()
+                client_disconnected = True
+                disconnect_event.set()
+                relay_task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await relay_task
+            else:
+                await relay_task
         finally:
+            if relay_task is not None and not relay_task.done():
+                relay_task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await relay_task
+            if disconnect_task is not None:
+                disconnect_task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await disconnect_task
             await response.aclose()
+
+        if client_disconnected:
+            return
 
         await send({"type": "http.response.body", "body": b"", "more_body": False})
         if self.cfg.load_balancer_routing == "smart":
@@ -934,6 +998,36 @@ class LoadBalancerApp:
             response.headers.get("content-type"),
             route_reason=route_reason,
         )
+
+    async def _wait_for_http_disconnect(self, receive) -> None:
+        parked = asyncio.Event()
+        while True:
+            try:
+                message = await receive()
+            except StopAsyncIteration:
+                await parked.wait()
+            except RuntimeError as exc:
+                if isinstance(exc.__cause__, StopIteration):
+                    await parked.wait()
+                raise
+            if message["type"] == "http.disconnect":
+                return
+
+    async def _relay_upstream_response(
+        self,
+        response,
+        send,
+        response_chunks: bytearray,
+        disconnect_event: asyncio.Event,
+    ) -> None:
+        async for chunk in response.aiter_raw():
+            if disconnect_event.is_set():
+                raise asyncio.CancelledError()
+            if chunk:
+                response_chunks.extend(chunk)
+            await send({"type": "http.response.body", "body": chunk, "more_body": True})
+            if disconnect_event.is_set():
+                raise asyncio.CancelledError()
 
     def _build_upstream_headers(self, headers, upstream_port: int) -> list[tuple[str, str]]:
         forwarded_headers: list[tuple[str, str]] = []

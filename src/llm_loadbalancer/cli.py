@@ -11,6 +11,7 @@ from loguru import logger
 
 from llm_loadbalancer.keep_connection import iter_commands, launch_in_tmux, parse_config, uses_ssh_tunnels
 from llm_loadbalancer.load_balancer import serve_forever
+from llm_loadbalancer.monitor.server import start_monitor_process
 
 logger.remove()
 
@@ -115,6 +116,7 @@ def start_everything(
     routing: str | None = None,
     no_cache: bool = False,
     reload: bool = False,
+    no_monitor: bool = False,
 ) -> int:
     ensure_config_exists(config_path)
     cfg = parse_config(config_path)
@@ -135,16 +137,24 @@ def start_everything(
     except RuntimeError as exc:
         logger.error("{}", exc)
         return 1
-    if routing is None:
-        serve_forever(config_path, verbose=verbose, no_cache=no_cache, reload=reload)
-    else:
-        serve_forever(
-            config_path,
-            verbose=verbose,
-            routing=routing,
-            no_cache=no_cache,
-            reload=reload,
-        )
+    monitor_proc = None
+    if not no_monitor:
+        monitor_proc = start_monitor_process()
+    try:
+        if routing is None:
+            serve_forever(config_path, verbose=verbose, no_cache=no_cache, reload=reload)
+        else:
+            serve_forever(
+                config_path,
+                verbose=verbose,
+                routing=routing,
+                no_cache=no_cache,
+                reload=reload,
+            )
+    finally:
+        if monitor_proc is not None:
+            monitor_proc.terminate()
+            monitor_proc.wait(timeout=5)
     return 0
 
 
@@ -183,6 +193,11 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Auto-restart when source files change",
     )
+    parser.add_argument(
+        "--no-monitor",
+        action="store_true",
+        help="Disable the web monitor dashboard (enabled by default)",
+    )
     return parser
 
 
@@ -200,6 +215,7 @@ def main(argv: list[str] | None = None) -> int:
                 verbose=not args.silent,
                 no_cache=args.no_cache,
                 reload=args.reload,
+                no_monitor=args.no_monitor,
             )
         return start_everything(
             args.config,
@@ -207,6 +223,7 @@ def main(argv: list[str] | None = None) -> int:
             routing=args.routing,
             no_cache=args.no_cache,
             reload=args.reload,
+            no_monitor=args.no_monitor,
         )
     except KeyboardInterrupt:
         return 130
